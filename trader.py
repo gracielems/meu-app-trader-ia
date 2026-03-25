@@ -1,3 +1,17 @@
+import os
+import subprocess
+import sys
+
+# Comando para instalar a biblioteca de sinais caso ela não esteja lá
+try:
+    import pandas_ta as ta
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas-ta"])
+    import pandas_ta as ta
+
+import streamlit as st
+import yfinance as yf
+# ... o restante do código continua igual
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -89,4 +103,5 @@ if st.button("🚀 Analisar e Gerar Sinal"):
                 
     except Exception as e:
         st.error(f"Erro ao analisar: {e}")
+
 
