@@ -3,59 +3,58 @@ import yfinance as yf
 import plotly.graph_objects as go
 import pandas as pd
 
-st.set_page_config(page_title="IA Trader Pro", layout="wide")
-st.title("🎯 IA DayTrade Personal")
+st.set_page_config(page_title="IA Trader Sniper", layout="wide")
+st.title("🎯 IA DayTrade Sniper - Alta Precisão")
 
-ticker = st.text_input("Digite o Ativo (Ex: PETR4.SA, BTC-USD)", "PETR4.SA")
+ticker = st.text_input("Ativo", "PETR4.SA")
 intervalo = st.selectbox("Tempo Gráfico", ["1m", "5m", "15m"], index=1)
 
-if st.button("🚀 Analisar Agora"):
+if st.button("🚀 Gerar Sinal Sniper"):
     try:
-        dados = yf.download(ticker, period="1d", interval=intervalo)
+        # Busca mais dados para calcular a média de 200
+        dados = yf.download(ticker, period="5d", interval=intervalo)
         
         if not dados.empty:
             if dados.columns.nlevels > 1:
                 dados.columns = dados.columns.get_level_values(0)
 
-            # Cálculos Técnicos
+            # Médias Móveis
             dados['MA8'] = dados['Close'].rolling(window=8).mean()
             dados['MA20'] = dados['Close'].rolling(window=20).mean()
+            dados['MA200'] = dados['Close'].rolling(window=200).mean()
             
-            # Cálculo do RSI (Força do Mercado)
+            # RSI
             delta = dados['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            dados['RSI'] = 100 - (100 / (1 + rs))
-
-            # Captura os últimos valores
-            ma8 = dados['MA8'].iloc[-1]
-            ma20 = dados['MA20'].iloc[-1]
-            rsi = dados['RSI'].iloc[-1]
-            preco = dados['Close'].iloc[-1]
-
-            # --- LÓGICA DA IA ---
-            # COMPRA: Média curta cruza acima da longa e mercado não está "caro" (RSI < 70)
-            if ma8 > ma20 and rsi < 70:
-                st.success(f"✅ SINAL: COMPRA (Preço: R$ {preco:.2f} | RSI: {rsi:.2f})")
-                st.write("👉 Motivo: Médias em alta e ainda há espaço para subir.")
+            dados['RSI'] = 100 - (100 / (1 + (gain / loss)))
             
-            # VENDA: Média curta cruza abaixo da longa e mercado não está "barato" (RSI > 30)
-            elif ma8 < ma20 and rsi > 30:
-                st.error(f"🚨 SINAL: VENDA (Preço: R$ {preco:.2f} | RSI: {rsi:.2f})")
-                st.write("👉 Motivo: Médias em queda e força vendedora aumentando.")
-            
+            # Volume
+            dados['Vol_Media'] = dados['Volume'].rolling(window=10).mean()
+
+            # Valores Atuais
+            c = dados.iloc[-1]
+            p = dados.iloc[-2] # Penúltimo para ver o cruzamento
+
+            # --- LÓGICA SNIPER (MAIS ASSERTIVA) ---
+            compra = (c['MA8'] > c['MA20']) and (c['RSI'] > 50) and (c['Close'] > c['MA200']) and (c['Volume'] > c['Vol_Media'])
+            venda = (c['MA8'] < c['MA20']) and (c['RSI'] < 50) and (c['Close'] < c['MA200']) and (c['Volume'] > c['Vol_Media'])
+
+            if compra:
+                st.success(f"🔥 SINAL FORTE DE COMPRA! (R$ {c['Close']:.2f})")
+                st.info("✅ Motivo: Tendência de alta confirmada pela MA200 + Volume acima da média.")
+            elif venda:
+                st.error(f"💀 SINAL FORTE DE VENDA! (R$ {c['Close']:.2f})")
+                st.info("✅ Motivo: Tendência de baixa confirmada pela MA200 + Pressão vendedora.")
             else:
-                st.warning(f"⚪ AGUARDAR (Preço: R$ {preco:.2f} | RSI: {rsi:.2f})")
-                st.write("👉 Motivo: Mercado sem direção clara ou muito esticado.")
+                st.warning("⚖️ AGUARDAR: Filtros de segurança não confirmados.")
+                st.write("Dica: O mercado pode estar sem volume ou contra a tendência principal.")
 
-            # Gráfico
-            fig = go.Figure(data=[go.Candlestick(
-                x=dados.index, open=dados['Open'], high=dados['High'],
-                low=dados['Low'], close=dados['Close'], name='Preço'
-            )])
+            # Gráfico com a MA200 (Linha Branca)
+            fig = go.Figure(data=[go.Candlestick(x=dados.index, open=dados['Open'], high=dados['High'], low=dados['Low'], close=dados['Close'], name='Preço')])
             fig.add_trace(go.Scatter(x=dados.index, y=dados['MA8'], name='Média 8', line=dict(color='cyan')))
             fig.add_trace(go.Scatter(x=dados.index, y=dados['MA20'], name='Média 20', line=dict(color='yellow')))
+            fig.add_trace(go.Scatter(x=dados.index, y=dados['MA200'], name='Média 200 (Tendência)', line=dict(color='white', width=3)))
             
             st.plotly_chart(fig, use_container_width=True)
 
