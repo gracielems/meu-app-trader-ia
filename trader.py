@@ -2,77 +2,90 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 import pandas as pd
+from datetime import datetime
 
-st.set_page_config(page_title="IA Trader Institucional", layout="wide")
-st.title("🏦 IA Trader - Nível Institucional")
+st.set_page_config(page_title="IA Market Intelligence", layout="wide")
 
-with st.sidebar:
-    st.header("Gestão de Capital")
-    capital = st.number_input("Seu Capital (R$)", value=1000.0)
-    risco_por_op = st.slider("Risco por Operação (%)", 0.5, 3.0, 1.0)
-    ticker = st.text_input("Ativo", "PETR4.SA")
-    intervalo = st.selectbox("Tempo Gráfico", ["1m", "5m", "15m"], index=1)
+# Estilo Visual
+st.markdown("<h1 style='text-align: center; color: #00FFCC;'>🏦 IA Intelligence - Scanner de Oportunidades</h1>", unsafe_allow_html=True)
 
-if st.button("🔍 Análise Completa de Mercado"):
-    try:
-        dados = yf.download(ticker, period="5d", interval=intervalo)
-        
-        if not dados.empty:
-            if dados.columns.nlevels > 1:
-                dados.columns = dados.columns.get_level_values(0)
+# Lista de ativos incluindo Dólar e Mini Dólar
+# Nota: No Yahoo Finance, o Mini Dólar é representado por WDO=F (Contrato Futuro)
+ACOES_SCANNER = ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'MGLU3.SA']
+CAMBIO_SCANNER = ['USDBRL=X', 'WDO=F', 'EURBRL=X']
 
-            # Indicadores de Elite
-            dados['MA8'] = dados['Close'].rolling(window=8).mean()
-            dados['MA20'] = dados['Close'].rolling(window=20).mean()
-            dados['MA200'] = dados['Close'].rolling(window=200).mean()
-            
-            # Suporte e Resistência (Máximas e Mínimas dos últimos 50 candles)
-            resistencia = dados['High'].rolling(window=50).max().iloc[-1]
-            suporte = dados['Low'].rolling(window=50).min().iloc[-1]
+def analisar_ativo(ticker):
+    # Busca dados de 5 dias para ter a Média 200 no gráfico de 5m
+    dados = yf.download(ticker, period="5d", interval="5m", progress=False)
+    if dados.empty: return None
+    
+    if dados.columns.nlevels > 1:
+        dados.columns = dados.columns.get_level_values(0)
+    
+    # Médias e RSI
+    ma20 = dados['Close'].rolling(window=20).mean()
+    ma200 = dados['Close'].rolling(window=200).mean()
+    delta = dados['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rsi = 100 - (100 / (1 + (gain / loss)))
+    
+    c = dados.iloc[-1]
+    
+    # Score de Inteligência (0 a 3)
+    score = 0
+    if c['Close'] > ma200.iloc[-1]: score += 1
+    if c['Close'] > ma20.iloc[-1]: score += 1
+    if 30 < rsi.iloc[-1] < 70: score += 1
+    
+    return {
+        "Ticker": ticker,
+        "Preço": round(c['Close'], 3),
+        "RSI": round(rsi.iloc[-1], 2),
+        "Sinal": "COMPRA" if score >= 2 else "AGUARDAR",
+        "Tendencia": "ALTA" if c['Close'] > ma200.iloc[-1] else "BAIXA"
+    }
 
-            c = dados.iloc[-1]
-            p = dados.iloc[-2]
+# Layout de Colunas
+col_cambio, col_acoes = st.columns(2)
 
-            # Lógica Institucional
-            trend_alta = c['Close'] > c['MA200']
-            cruzamento_alta = c['MA8'] > c['MA20']
-            distancia_resistencia = resistencia - c['Close']
+with col_cambio:
+    st.subheader("💵 Câmbio e Futuros")
+    if st.button("🔄 Atualizar Dólar"):
+        for moed in CAMBIO_SCANNER:
+            res = analisar_ativo(moed)
+            if res:
+                nome = "Mini Dólar" if "WDO" in moed else "Dólar Comercial" if "USD" in moed else "Euro"
+                cor = "green" if res['Sinal'] == "COMPRA" else "yellow"
+                st.info(f"**{nome}** ({res['Ticker']}): **R$ {res['Preço']}** | Tendência: {res['Tendencia']}")
 
-            st.subheader("📋 Veredito da IA")
-            col1, col2, col3 = st.columns(3)
+with col_acoes:
+    st.subheader("📊 Scanner de Ações (Top B3)")
+    if st.button("🚀 Escanear Ações"):
+        for acao in ACOES_SCANNER:
+            res = analisar_ativo(acao)
+            if res:
+                cor = "green" if res['Sinal'] == "COMPRA" else "yellow"
+                st.markdown(f"**{res['Ticker']}**: R$ {res['Preço']} | RSI: {res['RSI']} | :{cor}[{res['Sinal']}]")
 
-            if trend_alta and cruzamento_alta and distancia_resistencia > 0.10:
-                col1.success("SINAL: COMPRA FORTE")
-                # Cálculo de Gestão de Risco
-                stop = c['Low'] * 0.995 # 0.5% abaixo da mínima
-                alvo = c['Close'] + (c['Close'] - stop) * 2 # Relação 2 para 1
-                col2.metric("Stop Loss", f"R$ {stop:.2f}")
-                col3.metric("Alvo (Take Profit)", f"R$ {alvo:.2f}")
-                
-                # Cálculo de Lote
-                perda_financeira = capital * (risco_por_op / 100)
-                lote = int(perda_financeira / (c['Close'] - stop))
-                st.info(f"💡 Sugestão de Manejo: Compre **{lote}** ações para arriscar apenas R$ {perda_financeira:.2f}")
-            
-            elif not trend_alta and not cruzamento_alta:
-                col1.error("SINAL: VENDA/SHORT")
-                stop = c['High'] * 1.005
-                alvo = c['Close'] - (stop - c['Close']) * 2
-                col2.metric("Stop Loss", f"R$ {stop:.2f}")
-                col3.metric("Alvo", f"R$ {alvo:.2f}")
-            else:
-                col1.warning("SINAL: AGUARDAR")
-                st.write("Mercado perigoso: Preço muito próximo de resistência ou sem tendência definida.")
+# Seção de Notícias Real-Time
+st.divider()
+col_news, col_chart = st.columns([1, 2])
 
-            # Gráfico com Suporte e Resistência
-            fig = go.Figure(data=[go.Candlestick(x=dados.index, open=dados['Open'], high=dados['High'], low=dados['Low'], close=dados['Close'], name='Preço')])
-            fig.add_trace(go.Scatter(x=dados.index, y=dados['MA200'], name='Tendência (200)', line=dict(color='white', width=2)))
-            
-            # Linhas de Suporte e Resistência
-            fig.add_hline(y=resistencia, line_dash="dash", line_color="red", annotation_text="Resistência")
-            fig.add_hline(y=suporte, line_dash="dash", line_color="green", annotation_text="Suporte")
-            
-            st.plotly_chart(fig, use_container_width=True)
+with col_news:
+    st.subheader("📰 Notícias de Impacto")
+    ativo_foco = st.selectbox("Ver notícias de:", CAMBIO_SCANNER + ACOES_SCANNER)
+    ticker_obj = yf.Ticker(ativo_foco)
+    news = ticker_obj.news[:4]
+    for item in news:
+        st.write(f"🔗 [{item['title']}]({item['link']})")
+        st.caption(f"{item['publisher']} | {datetime.fromtimestamp(item['providerPublishTime']).strftime('%H:%M')}")
 
-    except Exception as e:
-        st.error(f"Erro: {e}")
+with col_chart:
+    st.subheader(f"📈 Gráfico Analítico: {ativo_foco}")
+    df_grafico = yf.download(ativo_foco, period="2d", interval="5m")
+    if not df_grafico.empty:
+        if df_grafico.columns.nlevels > 1: df_grafico.columns = df_grafico.columns.get_level_values(0)
+        fig = go.Figure(data=[go.Candlestick(x=df_grafico.index, open=df_grafico['Open'], high=df_grafico['High'], low=df_grafico['Low'], close=df_grafico['Close'], name='Candles')])
+        fig.update_layout(height=400, template="plotly_dark", margin=dict(l=0, r=0, t=0, b=0))
+        st.plotly_chart(fig, use_container_width=True)
