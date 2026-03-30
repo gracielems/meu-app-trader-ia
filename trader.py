@@ -1,91 +1,83 @@
 import streamlit as st
 import yfinance as yf
-import plotly.graph_objects as go
 import pandas as pd
+import plotly.graph_objects as go
 from datetime import datetime
 
-st.set_page_config(page_title="IA Market Intelligence", layout="wide")
+st.set_page_config(page_title="IA Elite Trader", layout="wide")
 
-# Estilo Visual
-st.markdown("<h1 style='text-align: center; color: #00FFCC;'>🏦 IA Intelligence - Scanner de Oportunidades</h1>", unsafe_allow_html=True)
+# Interface Estilizada
+st.markdown("<h1 style='text-align: center; color: #00FFCC;'>💎 IA Elite Trader - Intelligence</h1>", unsafe_allow_html=True)
 
-# Lista de ativos incluindo Dólar e Mini Dólar
-# Nota: No Yahoo Finance, o Mini Dólar é representado por WDO=F (Contrato Futuro)
-ACOES_SCANNER = ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'MGLU3.SA']
-CAMBIO_SCANNER = ['USDBRL=X', 'WDO=F', 'EURBRL=X']
+# 1. LISTA DE MONITORAMENTO PROFISSIONAL
+ATIVOS = {
+    "Ações B3": ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'MGLU3.SA'],
+    "Câmbio/Futuros": ['WDO=F', 'USDBRL=X', 'BTC-USD'],
+    "Global (EUA)": ['^GSPC', '^IXIC'] # S&P 500 e Nasdaq
+}
 
-def analisar_ativo(ticker):
-    # Busca dados de 5 dias para ter a Média 200 no gráfico de 5m
-    dados = yf.download(ticker, period="5d", interval="5m", progress=False)
-    if dados.empty: return None
-    
-    if dados.columns.nlevels > 1:
-        dados.columns = dados.columns.get_level_values(0)
-    
-    # Médias e RSI
-    ma20 = dados['Close'].rolling(window=20).mean()
-    ma200 = dados['Close'].rolling(window=200).mean()
-    delta = dados['Close'].diff()
+def calcular_indicadores(df):
+    # Médias Móveis
+    df['MA8'] = df['Close'].rolling(window=8).mean()
+    df['MA20'] = df['Close'].rolling(window=20).mean()
+    df['MA200'] = df['Close'].rolling(window=200).mean()
+    # RSI
+    delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rsi = 100 - (100 / (1 + (gain / loss)))
-    
-    c = dados.iloc[-1]
-    
-    # Score de Inteligência (0 a 3)
-    score = 0
-    if c['Close'] > ma200.iloc[-1]: score += 1
-    if c['Close'] > ma20.iloc[-1]: score += 1
-    if 30 < rsi.iloc[-1] < 70: score += 1
-    
-    return {
-        "Ticker": ticker,
-        "Preço": round(c['Close'], 3),
-        "RSI": round(rsi.iloc[-1], 2),
-        "Sinal": "COMPRA" if score >= 2 else "AGUARDAR",
-        "Tendencia": "ALTA" if c['Close'] > ma200.iloc[-1] else "BAIXA"
-    }
+    df['RSI'] = 100 - (100 / (1 + (gain / loss)))
+    return df
 
-# Layout de Colunas
-col_cambio, col_acoes = st.columns(2)
+# --- SIDEBAR: GESTÃO E NOTÍCIAS GLOBAIS ---
+with st.sidebar:
+    st.header("🌍 Sentimento Global")
+    try:
+        sp500 = yf.Ticker("^GSPC").history(period="1d")
+        variacao = ((sp500['Close'].iloc[-1] / sp500['Open'].iloc[-1]) - 1) * 100
+        cor_sp = "green" if variacao > 0 else "red"
+        st.metric("S&P 500 (EUA)", f"{variacao:.2f}%", delta_color="normal")
+        st.caption("Se o S&P 500 está negativo, cuidado com compras na B3.")
+    except:
+        st.write("Aguardando abertura de NY...")
 
-with col_cambio:
-    st.subheader("💵 Câmbio e Futuros")
-    if st.button("🔄 Atualizar Dólar"):
-        for moed in CAMBIO_SCANNER:
-            res = analisar_ativo(moed)
-            if res:
-                nome = "Mini Dólar" if "WDO" in moed else "Dólar Comercial" if "USD" in moed else "Euro"
-                cor = "green" if res['Sinal'] == "COMPRA" else "yellow"
-                st.info(f"**{nome}** ({res['Ticker']}): **R$ {res['Preço']}** | Tendência: {res['Tendencia']}")
+    st.divider()
+    st.header("⚙️ Configurações")
+    capital = st.number_input("Capital da Operação (R$)", value=1000.0)
 
-with col_acoes:
-    st.subheader("📊 Scanner de Ações (Top B3)")
-    if st.button("🚀 Escanear Ações"):
-        for acao in ACOES_SCANNER:
-            res = analisar_ativo(acao)
-            if res:
-                cor = "green" if res['Sinal'] == "COMPRA" else "yellow"
-                st.markdown(f"**{res['Ticker']}**: R$ {res['Preço']} | RSI: {res['RSI']} | :{cor}[{res['Sinal']}]")
+# --- CORPO PRINCIPAL ---
+tab1, tab2 = st.tabs(["🚀 Scanner de Sinais", "📰 Radar de Notícias"])
 
-# Seção de Notícias Real-Time
-st.divider()
-col_news, col_chart = st.columns([1, 2])
+with tab1:
+    st.subheader("Melhores Oportunidades Agora")
+    if st.button("🔍 Escanear Todo o Mercado"):
+        col1, col2 = st.columns(2)
+        
+        for cat, lista in ATIVOS.items():
+            for ticker in lista:
+                df = yf.download(ticker, period="5d", interval="5m", progress=False)
+                if df.empty: continue
+                if df.columns.nlevels > 1: df.columns = df.columns.get_level_values(0)
+                
+                df = calcular_indicadores(df)
+                c = df.iloc[-1]
+                
+                # Lógica de Elite: Tendência + Momentum + Volume
+                if c['Close'] > c['MA200'] and c['MA8'] > c['MA20'] and 30 < c['RSI'] < 65:
+                    with st.expander(f"✅ OPORTUNIDADE EM {ticker}", expanded=True):
+                        # Cálculo de Compra e Venda
+                        stop_loss = c['Close'] * 0.992 # 0.8% de stop
+                        take_profit = c['Close'] * 1.02 # 2% de alvo
+                        
+                        st.markdown(f"### **Sinal: COMPRAR AGORA**")
+                        st.write(f"📍 **Entrada:** R$ {c['Close']:.2f}")
+                        st.write(f"🛑 **Venda (Stop Loss):** R$ {stop_loss:.2f}")
+                        st.write(f"🎯 **Venda (Alvo/Lucro):** R$ {take_profit:.2f}")
+                        st.info(f"Análise: Ativo em forte tendência de alta acima da média de 200.")
 
-with col_news:
-    st.subheader("📰 Notícias de Impacto")
-    ativo_foco = st.selectbox("Ver notícias de:", CAMBIO_SCANNER + ACOES_SCANNER)
-    ticker_obj = yf.Ticker(ativo_foco)
-    news = ticker_obj.news[:4]
-    for item in news:
-        st.write(f"🔗 [{item['title']}]({item['link']})")
-        st.caption(f"{item['publisher']} | {datetime.fromtimestamp(item['providerPublishTime']).strftime('%H:%M')}")
-
-with col_chart:
-    st.subheader(f"📈 Gráfico Analítico: {ativo_foco}")
-    df_grafico = yf.download(ativo_foco, period="2d", interval="5m")
-    if not df_grafico.empty:
-        if df_grafico.columns.nlevels > 1: df_grafico.columns = df_grafico.columns.get_level_values(0)
-        fig = go.Figure(data=[go.Candlestick(x=df_grafico.index, open=df_grafico['Open'], high=df_grafico['High'], low=df_grafico['Low'], close=df_grafico['Close'], name='Candles')])
-        fig.update_layout(height=400, template="plotly_dark", margin=dict(l=0, r=0, t=0, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+with tab2:
+    st.subheader("Fatos Relevantes e Notícias Globais")
+    ativo_news = st.selectbox("Notícias de:", ATIVOS['Ações B3'] + ATIVOS['Câmbio/Futuros'])
+    ticker_obj = yf.Ticker(ativo_news)
+    for n in ticker_obj.news[:5]:
+        st.markdown(f"⭐ **[{n['title']}]({n['link']})**")
+        st.caption(f"Fonte: {n['publisher']}")
