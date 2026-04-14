@@ -494,6 +494,7 @@ def evaluate_asset_from_indicator_frames(
     daily: pd.DataFrame,
     structure: pd.DataFrame,
     trigger: pd.DataFrame,
+    benchmark_trigger: Optional[pd.DataFrame],
     regime_info: Dict[str, float],
     capital: float,
     risk_per_trade_pct: float,
@@ -508,6 +509,7 @@ def evaluate_asset_from_indicator_frames(
     require_strong_candle: bool,
     allowed_windows: List[Tuple[time, time]],
     trigger_interval: str,
+    require_index_intraday: bool,
 ) -> Dict[str, float]:
     d = daily.iloc[-1]
     s = structure.iloc[-1]
@@ -552,6 +554,14 @@ def evaluate_asset_from_indicator_frames(
     strong_candle = bull_candle and body_frac >= 0.55 and close_to_high <= 0.25
     time_ok = True if trigger_interval == "1d" else within_any_window(trigger.index[-1], allowed_windows)
 
+    index_intraday_ok = True
+    if require_index_intraday and trigger_interval != "1d" and benchmark_trigger is not None and not benchmark_trigger.empty:
+        b = benchmark_trigger.iloc[-1]
+        b_close = float(b["Close"])
+        b_ema21 = float(b["EMA21"])
+        b_vwap = float(b["VWAP"]) if pd.notna(b["VWAP"]) else np.nan
+        index_intraday_ok = b_close > b_ema21 and (pd.isna(b_vwap) or b_close > b_vwap)
+
     stop_pct = (levels["entry"] - levels["stop"]) / levels["entry"] if levels["entry"] > 0 else np.nan
     upside_pct = (levels["target"] - levels["entry"]) / levels["entry"] if levels["entry"] > 0 else np.nan
 
@@ -564,6 +574,14 @@ def evaluate_asset_from_indicator_frames(
     else:
         score -= 20
         alerts.append("Mercado defensivo")
+
+    if require_index_intraday and trigger_interval != "1d":
+        if index_intraday_ok:
+            score += 8
+            strengths.append("Índice intraday alinhado")
+        else:
+            score -= 12
+            alerts.append("Índice intraday fraco")
 
     if close_daily > daily_ema21 > daily_ema50:
         score += 24
@@ -688,6 +706,8 @@ def evaluate_asset_from_indicator_frames(
 
     if not time_ok:
         hard_blocks.append("Fora da janela de horário")
+    if require_index_intraday and trigger_interval != "1d" and not index_intraday_ok:
+        hard_blocks.append("Índice intraday abaixo da EMA21/VWAP")
     if regime_info["regime"] == "DEFENSIVO":
         hard_blocks.append("Mercado defensivo")
     if close_daily <= daily_ema21:
@@ -782,15 +802,18 @@ def build_summary(
     require_breakout: bool,
     require_strong_candle: bool,
     allowed_windows: List[Tuple[time, time]],
+    require_index_intraday: bool,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, float], pd.DataFrame]:
     rows = []
     chart_map: Dict[str, pd.DataFrame] = {}
     debug_rows = []
 
     benchmark_daily = load_data(benchmark, trend_period, "1d")
+    benchmark_trigger_raw = load_data(benchmark, trigger_period, trigger_interval)
     regime_table = build_regime_table(benchmark_daily)
     regime_info = get_regime_info_at(regime_table, benchmark_daily.index.max() if not benchmark_daily.empty else pd.Timestamp.now())
     benchmark_daily_close = benchmark_daily["Close"] if not benchmark_daily.empty else pd.Series(dtype=float)
+    benchmark_trigger_ind = add_indicators(benchmark_trigger_raw, trigger_interval, None) if not benchmark_trigger_raw.empty else pd.DataFrame()
 
     structure_period, structure_interval = get_structure_settings(trigger_interval)
 
@@ -817,6 +840,7 @@ def build_summary(
                 daily=daily_ind,
                 structure=structure_ind,
                 trigger=trigger_ind,
+                benchmark_trigger=benchmark_trigger_ind,
                 regime_info=regime_info,
                 capital=capital,
                 risk_per_trade_pct=risk_per_trade_pct,
@@ -831,6 +855,7 @@ def build_summary(
                 require_strong_candle=require_strong_candle,
                 allowed_windows=allowed_windows,
                 trigger_interval=trigger_interval,
+                require_index_intraday=require_index_intraday,
             )
 
             rows.append(evaluated)
@@ -964,6 +989,10 @@ def run_backtest(
     allowed_windows: List[Tuple[time, time]],
     breakeven_r: float,
     partial_size_pct: float,
+    require_index_intraday: bool,
+    max_trades_per_day: int,
+    max_consecutive_losses: int,
+    one_trade_per_asset_day: bool,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     trades: List[Dict] = []
     debug_rows: List[Dict] = []
@@ -972,8 +1001,10 @@ def run_backtest(
     daily_period = at_least_period(backtest_period, "6mo")
 
     benchmark_daily = load_data(benchmark, daily_period, "1d")
+    benchmark_trigger_raw = load_data(benchmark, fetch_period if trigger_interval != "1d" else backtest_period, trigger_interval)
     benchmark_daily_close = benchmark_daily["Close"] if not benchmark_daily.empty else pd.Series(dtype=float)
     regime_table = build_regime_table(benchmark_daily)
+    benchmark_trigger_ind = add_indicators(benchmark_trigger_raw, trigger_interval, None) if not benchmark_trigger_raw.empty else pd.DataFrame()
 
     structure_period, structure_interval = get_structure_settings(trigger_interval)
     if trigger_interval != "1d":
@@ -999,11 +1030,26 @@ def run_backtest(
 
             i = 20
             trades_count = 0
+            trade_count_by_day: Dict = {}
+            loss_streak_by_day: Dict = {}
+            traded_days: set = set()
             while i < len(trigger_ind) - 1:
                 ts = pd.Timestamp(trigger_ind.index[i])
+                day_key = ts.date()
+                if one_trade_per_asset_day and day_key in traded_days:
+                    i += 1
+                    continue
+                if trade_count_by_day.get(day_key, 0) >= max_trades_per_day:
+                    i += 1
+                    continue
+                if loss_streak_by_day.get(day_key, 0) >= max_consecutive_losses:
+                    i += 1
+                    continue
+
                 daily_slice = daily_ind.loc[daily_ind.index <= ts]
                 structure_slice = structure_ind.loc[structure_ind.index <= ts]
                 trigger_slice = trigger_ind.iloc[: i + 1]
+                benchmark_trigger_slice = benchmark_trigger_ind.loc[benchmark_trigger_ind.index <= ts] if not benchmark_trigger_ind.empty else pd.DataFrame()
                 regime_info = get_regime_info_at(regime_table, ts)
 
                 if daily_slice.empty or structure_slice.empty or len(trigger_slice) < 20:
@@ -1015,6 +1061,7 @@ def run_backtest(
                     daily=daily_slice,
                     structure=structure_slice,
                     trigger=trigger_slice,
+                    benchmark_trigger=benchmark_trigger_slice,
                     regime_info=regime_info,
                     capital=capital,
                     risk_per_trade_pct=risk_per_trade_pct,
@@ -1029,6 +1076,7 @@ def run_backtest(
                     require_strong_candle=require_strong_candle,
                     allowed_windows=allowed_windows,
                     trigger_interval=trigger_interval,
+                    require_index_intraday=require_index_intraday,
                 )
 
                 if evaluated["decision"] != "OPERAR AGORA":
@@ -1081,6 +1129,12 @@ def run_backtest(
                     }
                 )
                 trades_count += 1
+                trade_count_by_day[day_key] = trade_count_by_day.get(day_key, 0) + 1
+                traded_days.add(day_key)
+                if pnl <= 0:
+                    loss_streak_by_day[day_key] = loss_streak_by_day.get(day_key, 0) + 1
+                else:
+                    loss_streak_by_day[day_key] = 0
                 i = exit_idx + 1
 
             debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "ok" if trades_count > 0 else "sem trades", "motivo": f"{trades_count} trades no backtest" if trades_count > 0 else "nenhuma barra passou pelos filtros"})
@@ -1229,6 +1283,7 @@ with st.sidebar:
     entry_min_score = st.slider("Score mínimo para entrada", 70, 100, 85, 1)
     require_breakout = st.checkbox("Exigir rompimento confirmado", value=True)
     require_strong_candle = st.checkbox("Exigir candle de força", value=True)
+    require_index_intraday = st.checkbox("Exigir índice intraday alinhado", value=True)
 
     st.divider()
     st.subheader("Filtro de horário")
@@ -1245,6 +1300,9 @@ with st.sidebar:
     total_cost_pct = st.slider("Custo total por transação (%)", 0.0, 1.0, 0.10, 0.01) / 100
     breakeven_r = st.slider("Mover stop para breakeven em (R)", 0.5, 2.0, 1.0, 0.1)
     partial_size_pct = st.slider("Parcial no 1R (% da posição)", 25, 75, 50, 5) / 100
+    max_trades_per_day = st.slider("Máximo de trades por dia/ativo", 1, 5, 2)
+    max_consecutive_losses = st.slider("Máximo de perdas seguidas por dia/ativo", 1, 3, 2)
+    one_trade_per_asset_day = st.checkbox("Só 1 trade por ativo por dia", value=False)
 
     st.divider()
     auto_refresh = st.checkbox("Atualização automática", value=False)
@@ -1298,6 +1356,7 @@ summary, chart_map, regime_info, debug_df = build_summary(
     require_breakout=require_breakout,
     require_strong_candle=require_strong_candle,
     allowed_windows=allowed_windows,
+    require_index_intraday=require_index_intraday,
 )
 
 if summary.empty:
@@ -1454,6 +1513,10 @@ if run_backtest_toggle:
         allowed_windows=allowed_windows,
         breakeven_r=breakeven_r,
         partial_size_pct=partial_size_pct,
+        require_index_intraday=require_index_intraday,
+        max_trades_per_day=max_trades_per_day,
+        max_consecutive_losses=max_consecutive_losses,
+        one_trade_per_asset_day=one_trade_per_asset_day,
     )
 
     if bt_trades.empty:
@@ -1510,6 +1573,9 @@ with st.expander("Como o robô decide"):
         - candle de força
         - parcial no 1R
         - breakeven automático
+        - filtro do índice intraday
+        - limite de trades por dia
+        - trava por perdas seguidas no backtest
 
         **Bloqueios duros atuais:**
         - fora da janela de horário
