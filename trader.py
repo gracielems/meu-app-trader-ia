@@ -1189,12 +1189,61 @@ def run_backtest(
             win_rate=("pnl", lambda s: (s > 0).mean()),
             avg_r=("r_multiple", "mean"),
             avg_score=("score", "mean"),
+            gross_profit=("pnl", lambda s: s[s > 0].sum()),
+            gross_loss=("pnl", lambda s: abs(s[s <= 0].sum())),
+            winners=("pnl", lambda s: int((s > 0).sum())),
+            losers=("pnl", lambda s: int((s <= 0).sum())),
         )
         .reset_index()
-        .sort_values(["net_profit", "win_rate"], ascending=False)
     )
+    by_ticker["profit_factor"] = by_ticker.apply(
+        lambda row: row["gross_profit"] / row["gross_loss"] if row["gross_loss"] > 0 else np.nan,
+        axis=1,
+    )
+    by_ticker = by_ticker.sort_values(["net_profit", "profit_factor", "win_rate"], ascending=False)
 
     return summary_df, trades_df, by_ticker, debug_df
+
+
+def select_tickers_from_backtest(
+    bt_by_ticker: pd.DataFrame,
+    min_trades_asset: int,
+    min_win_rate_asset: float,
+    min_avg_r_asset: float,
+    require_positive_net_profit_asset: bool,
+    require_positive_profit_factor_asset: bool,
+) -> Tuple[List[str], pd.DataFrame, pd.DataFrame]:
+    if bt_by_ticker.empty:
+        return [], pd.DataFrame(), pd.DataFrame()
+
+    decisions = []
+    for _, row in bt_by_ticker.iterrows():
+        reasons = []
+        if int(row["trades"]) < min_trades_asset:
+            reasons.append(f"menos de {min_trades_asset} trades")
+        if float(row["win_rate"]) < min_win_rate_asset:
+            reasons.append(f"win rate abaixo de {min_win_rate_asset * 100:.0f}%")
+        if float(row["avg_r"]) < min_avg_r_asset:
+            reasons.append(f"expectância média abaixo de {min_avg_r_asset:.2f}R")
+        if require_positive_net_profit_asset and float(row["net_profit"]) <= 0:
+            reasons.append("lucro líquido não positivo")
+        if require_positive_profit_factor_asset and pd.notna(row["profit_factor"]) and float(row["profit_factor"]) <= 1:
+            reasons.append("profit factor abaixo de 1")
+
+        decisions.append(
+            {
+                "ticker": row["ticker"],
+                "aprovado": len(reasons) == 0,
+                "motivos": " | ".join(reasons) if reasons else "Aprovado no filtro histórico",
+            }
+        )
+
+    decision_df = pd.DataFrame(decisions)
+    merged = bt_by_ticker.merge(decision_df, on="ticker", how="left")
+    approved_df = merged[merged["aprovado"]].copy().sort_values(["net_profit", "profit_factor"], ascending=False)
+    blocked_df = merged[~merged["aprovado"]].copy().sort_values(["net_profit", "win_rate"], ascending=[False, False])
+    approved_labels = approved_df["ticker"].tolist()
+    return approved_labels, approved_df, blocked_df
 
 
 # =========================================================
@@ -1251,8 +1300,8 @@ def build_equity_chart(trades_df: pd.DataFrame) -> go.Figure:
 # =========================================================
 # INTERFACE
 # =========================================================
-st.title("📈 Robô Pessoal de Análise de Ações — V6")
-st.caption("Agora com filtro de horário, RVOL contextual, candle de força e proteção parcial/breakeven.")
+st.title("📈 Robô Pessoal de Análise de Ações — V7")
+st.caption("Agora filtrando automaticamente os ativos que realmente sustentam resultado no backtest, além dos filtros intraday.")
 
 with st.sidebar:
     st.header("Configurações")
@@ -1284,6 +1333,15 @@ with st.sidebar:
     require_breakout = st.checkbox("Exigir rompimento confirmado", value=True)
     require_strong_candle = st.checkbox("Exigir candle de força", value=True)
     require_index_intraday = st.checkbox("Exigir índice intraday alinhado", value=True)
+
+    st.divider()
+    st.subheader("Filtro histórico dos ativos")
+    use_performance_filter = st.checkbox("Usar só ativos aprovados no backtest", value=True)
+    min_trades_asset = st.slider("Mínimo de trades por ativo no backtest", 3, 20, 5)
+    min_win_rate_asset = st.slider("Win rate mínimo por ativo (%)", 30, 80, 45) / 100
+    min_avg_r_asset = st.slider("Expectância mínima por ativo (R)", -0.20, 0.30, 0.00, 0.01)
+    require_positive_net_profit_asset = st.checkbox("Exigir lucro líquido positivo por ativo", value=True)
+    require_positive_profit_factor_asset = st.checkbox("Exigir profit factor acima de 1 por ativo", value=True)
 
     st.divider()
     st.subheader("Filtro de horário")
@@ -1338,8 +1396,56 @@ if auto_refresh:
         height=0,
     )
 
+bt_summary = pd.DataFrame()
+bt_trades = pd.DataFrame()
+bt_by_ticker = pd.DataFrame()
+bt_debug = pd.DataFrame()
+approved_bt_df = pd.DataFrame()
+blocked_bt_df = pd.DataFrame()
+filtered_tickers = tickers.copy()
+
+if use_performance_filter or run_backtest_toggle:
+    bt_summary, bt_trades, bt_by_ticker, bt_debug = run_backtest(
+        tickers=tickers,
+        backtest_period=backtest_period,
+        trigger_interval=trigger_interval,
+        benchmark=benchmark,
+        capital=capital,
+        risk_per_trade_pct=risk_per_trade_pct,
+        max_position_pct=max_position_pct,
+        min_rr=min_rr,
+        min_upside_pct=min_upside_pct,
+        min_liquidity_million=min_liquidity_million,
+        max_hold_bars=max_hold_bars,
+        total_cost_pct=total_cost_pct,
+        entry_min_rvol=entry_min_rvol,
+        entry_max_rsi=entry_max_rsi,
+        entry_min_score=entry_min_score,
+        require_breakout=require_breakout,
+        require_strong_candle=require_strong_candle,
+        allowed_windows=allowed_windows,
+        breakeven_r=breakeven_r,
+        partial_size_pct=partial_size_pct,
+        require_index_intraday=require_index_intraday,
+        max_trades_per_day=max_trades_per_day,
+        max_consecutive_losses=max_consecutive_losses,
+        one_trade_per_asset_day=one_trade_per_asset_day,
+    )
+
+    if use_performance_filter and not bt_by_ticker.empty:
+        label_to_full = {t.replace(".SA", ""): t for t in tickers}
+        approved_labels, approved_bt_df, blocked_bt_df = select_tickers_from_backtest(
+            bt_by_ticker=bt_by_ticker,
+            min_trades_asset=min_trades_asset,
+            min_win_rate_asset=min_win_rate_asset,
+            min_avg_r_asset=min_avg_r_asset,
+            require_positive_net_profit_asset=require_positive_net_profit_asset,
+            require_positive_profit_factor_asset=require_positive_profit_factor_asset,
+        )
+        filtered_tickers = [label_to_full[label] for label in approved_labels if label in label_to_full]
+
 summary, chart_map, regime_info, debug_df = build_summary(
-    tickers=tickers,
+    tickers=filtered_tickers,
     trigger_period=trigger_period,
     trigger_interval=trigger_interval,
     trend_period=trend_period,
@@ -1359,11 +1465,50 @@ summary, chart_map, regime_info, debug_df = build_summary(
     require_index_intraday=require_index_intraday,
 )
 
+if use_performance_filter and len(filtered_tickers) == 0:
+    st.error("Nenhum ativo passou no filtro histórico do backtest. Isso é melhor do que forçar operação ruim.")
+    if not blocked_bt_df.empty:
+        view_blocked = blocked_bt_df[["ticker", "trades", "win_rate", "avg_r", "net_profit", "profit_factor", "motivos"]].copy()
+        view_blocked.columns = ["Ticker", "Trades", "Win rate", "Média em R", "Lucro líquido", "Profit factor", "Motivos"]
+        view_blocked["Win rate"] = view_blocked["Win rate"].map(format_pct)
+        view_blocked["Média em R"] = view_blocked["Média em R"].map(lambda x: f"{x:.2f}")
+        view_blocked["Lucro líquido"] = view_blocked["Lucro líquido"].map(format_money)
+        view_blocked["Profit factor"] = view_blocked["Profit factor"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+        st.dataframe(view_blocked, use_container_width=True, hide_index=True)
+    st.stop()
+
 if summary.empty:
     st.error("O app abriu, mas nenhum ativo retornou dados válidos para montar a análise.")
     if not debug_df.empty:
         st.dataframe(debug_df, use_container_width=True, hide_index=True)
     st.stop()
+
+if use_performance_filter and not bt_by_ticker.empty:
+    st.subheader("Filtro histórico dos ativos")
+    f1, f2, f3 = st.columns(3)
+    f1.metric("Ativos aprovados", len(filtered_tickers))
+    f2.metric("Ativos bloqueados", len(blocked_bt_df))
+    f3.metric("Universo original", len(tickers))
+
+    if not approved_bt_df.empty:
+        with st.expander("✅ Ativos aprovados pelo histórico"):
+            view_ok = approved_bt_df[["ticker", "trades", "win_rate", "avg_r", "net_profit", "profit_factor"]].copy()
+            view_ok.columns = ["Ticker", "Trades", "Win rate", "Média em R", "Lucro líquido", "Profit factor"]
+            view_ok["Win rate"] = view_ok["Win rate"].map(format_pct)
+            view_ok["Média em R"] = view_ok["Média em R"].map(lambda x: f"{x:.2f}")
+            view_ok["Lucro líquido"] = view_ok["Lucro líquido"].map(format_money)
+            view_ok["Profit factor"] = view_ok["Profit factor"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+            st.dataframe(view_ok, use_container_width=True, hide_index=True)
+
+    if not blocked_bt_df.empty:
+        with st.expander("🚫 Ativos bloqueados pelo histórico"):
+            view_blocked = blocked_bt_df[["ticker", "trades", "win_rate", "avg_r", "net_profit", "profit_factor", "motivos"]].copy()
+            view_blocked.columns = ["Ticker", "Trades", "Win rate", "Média em R", "Lucro líquido", "Profit factor", "Motivos"]
+            view_blocked["Win rate"] = view_blocked["Win rate"].map(format_pct)
+            view_blocked["Média em R"] = view_blocked["Média em R"].map(lambda x: f"{x:.2f}")
+            view_blocked["Lucro líquido"] = view_blocked["Lucro líquido"].map(format_money)
+            view_blocked["Profit factor"] = view_blocked["Profit factor"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+            st.dataframe(view_blocked, use_container_width=True, hide_index=True)
 
 if not debug_df.empty:
     problemas = debug_df[debug_df["status"] != "ok"]
@@ -1388,7 +1533,13 @@ st.markdown(f"### {decision_icon} Decisão final do melhor ativo: **{best_row['t
 st.caption(f"Score {best_row['score']:.0f} | Entrada {best_row['entry']:.2f} | Stop {best_row['stop']:.2f} | Alvo {best_row['target']:.2f}")
 
 st.subheader("Top oportunidades")
-top_df = summary.head(top_n).copy()
+approved_now_df = summary[summary["decision"] == "OPERAR AGORA"].copy()
+if not approved_now_df.empty:
+    st.caption(f"Mostrando {len(approved_now_df)} ativo(s) com sinal OPERAR AGORA dentro do universo aprovado.")
+    top_df = approved_now_df.head(top_n).copy()
+else:
+    st.caption("Nenhum ativo está em OPERAR AGORA agora. O robô está preservando caixa.")
+    top_df = summary.head(top_n).copy()
 cols = st.columns(len(top_df))
 for col, (_, row) in zip(cols, top_df.iterrows()):
     signal_icon = SIGNAL_COLORS.get(row["decision"], "•")
@@ -1492,33 +1643,6 @@ r12.metric("Risco financeiro", format_money(selected_row["risk_amount"]))
 if run_backtest_toggle:
     st.divider()
     st.subheader("🧪 Backtest rápido da estratégia")
-    bt_summary, bt_trades, bt_by_ticker, bt_debug = run_backtest(
-        tickers=tickers,
-        backtest_period=backtest_period,
-        trigger_interval=trigger_interval,
-        benchmark=benchmark,
-        capital=capital,
-        risk_per_trade_pct=risk_per_trade_pct,
-        max_position_pct=max_position_pct,
-        min_rr=min_rr,
-        min_upside_pct=min_upside_pct,
-        min_liquidity_million=min_liquidity_million,
-        max_hold_bars=max_hold_bars,
-        total_cost_pct=total_cost_pct,
-        entry_min_rvol=entry_min_rvol,
-        entry_max_rsi=entry_max_rsi,
-        entry_min_score=entry_min_score,
-        require_breakout=require_breakout,
-        require_strong_candle=require_strong_candle,
-        allowed_windows=allowed_windows,
-        breakeven_r=breakeven_r,
-        partial_size_pct=partial_size_pct,
-        require_index_intraday=require_index_intraday,
-        max_trades_per_day=max_trades_per_day,
-        max_consecutive_losses=max_consecutive_losses,
-        one_trade_per_asset_day=one_trade_per_asset_day,
-    )
-
     if bt_trades.empty:
         st.warning("O backtest não encontrou trades com as regras atuais.")
         if not bt_debug.empty:
@@ -1543,10 +1667,12 @@ if run_backtest_toggle:
 
         with st.expander("📊 Resultado por ativo"):
             view_bt = bt_by_ticker.copy()
-            view_bt.columns = ["Ticker", "Trades", "Lucro líquido", "Win rate", "Média em R", "Score médio"]
+            view_bt = view_bt[["ticker", "trades", "net_profit", "win_rate", "avg_r", "profit_factor", "avg_score", "winners", "losers"]]
+            view_bt.columns = ["Ticker", "Trades", "Lucro líquido", "Win rate", "Média em R", "Profit factor", "Score médio", "Vencedores", "Perdedores"]
             view_bt["Lucro líquido"] = view_bt["Lucro líquido"].map(format_money)
             view_bt["Win rate"] = view_bt["Win rate"].map(format_pct)
             view_bt["Média em R"] = view_bt["Média em R"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+            view_bt["Profit factor"] = view_bt["Profit factor"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
             view_bt["Score médio"] = view_bt["Score médio"].map(lambda x: f"{x:.1f}")
             st.dataframe(view_bt, use_container_width=True, hide_index=True)
 
@@ -1566,7 +1692,7 @@ with st.expander("Como o robô decide"):
         - **OBSERVAR**: ativo interessante, mas faltou confirmação.
         - **NÃO OPERAR**: o robô recusou o trade por filtro duro.
 
-        **Melhorias da V6:**
+        **Melhorias da V7:**
         - filtro de horário
         - RVOL contextual por horário
         - rompimento confirmado
@@ -1576,6 +1702,7 @@ with st.expander("Como o robô decide"):
         - filtro do índice intraday
         - limite de trades por dia
         - trava por perdas seguidas no backtest
+        - filtro histórico que aprova só os ativos que performam bem
 
         **Bloqueios duros atuais:**
         - fora da janela de horário
