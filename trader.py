@@ -11,12 +11,13 @@ import yfinance as yf
 
 
 st.set_page_config(
-    page_title="Robô de Análise de Ações V3",
+    page_title="Robô de Análise de Ações — V3",
     page_icon="📈",
     layout="wide",
 )
 
 DEFAULT_TICKERS = "PETR4, VALE3, BBAS3, ITUB4, WEGE3, BBDC4, ABEV3, RENT3"
+
 PERIOD_OPTIONS = {
     "5 dias": "5d",
     "1 mês": "1mo",
@@ -24,6 +25,7 @@ PERIOD_OPTIONS = {
     "6 meses": "6mo",
     "1 ano": "1y",
 }
+
 INTERVAL_OPTIONS = {
     "5 minutos": "5m",
     "15 minutos": "15m",
@@ -31,16 +33,19 @@ INTERVAL_OPTIONS = {
     "60 minutos": "60m",
     "Diário": "1d",
 }
+
 TREND_PERIOD_OPTIONS = {
     "6 meses": "6mo",
     "1 ano": "1y",
     "2 anos": "2y",
 }
+
 SIGNAL_COLORS = {
     "OPERAR AGORA": "🟢",
     "OBSERVAR": "🟡",
     "NÃO OPERAR": "🔴",
 }
+
 REGIME_COLORS = {
     "COMPRADOR": "🟢",
     "LATERAL": "🟡",
@@ -48,13 +53,15 @@ REGIME_COLORS = {
 }
 
 
-# =============================
-# Utilidades
-# =============================
+# =========================================================
+# UTILIDADES
+# =========================================================
 def normalize_ticker(raw: str) -> str:
     ticker = raw.strip().upper().replace(" ", "")
     if not ticker:
         return ""
+    if ticker.startswith("^"):
+        return ticker
     if "." not in ticker and ticker[-1].isdigit():
         ticker += ".SA"
     return ticker
@@ -76,20 +83,10 @@ def format_pct(value: float) -> str:
     return f"{value * 100:.2f}%"
 
 
-# =============================
-# Dados
-# =============================
-@st.cache_data(ttl=900, show_spinner=False)
-def load_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.download(
-        ticker,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-
+# =========================================================
+# DADOS
+# =========================================================
+def _prepare_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -97,6 +94,7 @@ def load_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
         df.columns = df.columns.get_level_values(0)
 
     df = df.rename(columns=str.title).copy()
+
     required_cols = {"Open", "High", "Low", "Close", "Volume"}
     if not required_cols.issubset(df.columns):
         return pd.DataFrame()
@@ -106,38 +104,86 @@ def load_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def load_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    tentativas = []
+
+    try:
+        df1 = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        tentativas.append(df1)
+    except Exception:
+        tentativas.append(pd.DataFrame())
+
+    try:
+        df2 = yf.Ticker(ticker).history(
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+        )
+        tentativas.append(df2)
+    except Exception:
+        tentativas.append(pd.DataFrame())
+
+    for df in tentativas:
+        preparado = _prepare_ohlcv(df)
+        if not preparado.empty:
+            return preparado
+
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def load_benchmark(period: str, interval: str, benchmark: str) -> pd.DataFrame:
-    df = yf.download(
-        benchmark,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-    if df is None or df.empty:
-        return pd.DataFrame()
+    tentativas = []
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    try:
+        df1 = yf.download(
+            benchmark,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        tentativas.append(df1)
+    except Exception:
+        tentativas.append(pd.DataFrame())
 
-    df = df.rename(columns=str.title).copy()
-    required_cols = {"Open", "High", "Low", "Close", "Volume"}
-    if not required_cols.issubset(df.columns):
-        return pd.DataFrame()
+    try:
+        df2 = yf.Ticker(benchmark).history(
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+        )
+        tentativas.append(df2)
+    except Exception:
+        tentativas.append(pd.DataFrame())
 
-    return df.dropna(subset=["Close"]).copy()
+    for df in tentativas:
+        preparado = _prepare_ohlcv(df)
+        if not preparado.empty:
+            return preparado
+
+    return pd.DataFrame()
 
 
-# =============================
-# Indicadores
-# =============================
+# =========================================================
+# INDICADORES
+# =========================================================
 def calculate_rsi(close: pd.Series, window: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+
     avg_gain = gain.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
+
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
@@ -176,22 +222,48 @@ def calculate_indicators(df: pd.DataFrame, benchmark_close: Optional[pd.Series] 
     data["Min20"] = data["Low"].rolling(20).min()
     data["Min10"] = data["Low"].rolling(10).min()
 
+    # força relativa adaptativa
+    data["ForcaRelativa"] = np.nan
     if benchmark_close is not None and not benchmark_close.empty:
         aligned_bench = benchmark_close.reindex(data.index).ffill().bfill()
-        bench_ret_60 = aligned_bench.pct_change(60)
-        asset_ret_60 = data["Close"].pct_change(60)
-        data["ForcaRelativa60"] = asset_ret_60 - bench_ret_60
-    else:
-        data["ForcaRelativa60"] = np.nan
+        if len(data) >= 60:
+            lookback = 60
+        elif len(data) >= 30:
+            lookback = 20
+        elif len(data) >= 15:
+            lookback = 10
+        else:
+            lookback = 5
 
-    return data.dropna().copy()
+        asset_ret = data["Close"].pct_change(lookback)
+        bench_ret = aligned_bench.pct_change(lookback)
+        data["ForcaRelativa"] = asset_ret - bench_ret
+
+    subset_cols = [
+        "EMA9",
+        "EMA21",
+        "EMA50",
+        "EMA200",
+        "VWAP",
+        "ATR14",
+        "Volatilidade20",
+        "VolumeMA20",
+        "RVOL",
+        "RSI14",
+        "Max20",
+        "Min20",
+        "Min10",
+    ]
+
+    data = data.dropna(subset=subset_cols).copy()
+    return data
 
 
 def detect_market_regime(benchmark_df: pd.DataFrame) -> Dict[str, str]:
-    if benchmark_df.empty or len(benchmark_df) < 60:
+    if benchmark_df.empty or len(benchmark_df) < 30:
         return {
             "regime": "LATERAL",
-            "reason": "Sem dados suficientes do benchmark.",
+            "reason": "Sem dados suficientes do índice.",
             "close": np.nan,
             "ema21": np.nan,
             "ema50": np.nan,
@@ -202,7 +274,7 @@ def detect_market_regime(benchmark_df: pd.DataFrame) -> Dict[str, str]:
     if bench.empty:
         return {
             "regime": "LATERAL",
-            "reason": "Benchmark sem dados válidos após indicadores.",
+            "reason": "Índice sem dados válidos após indicadores.",
             "close": np.nan,
             "ema21": np.nan,
             "ema50": np.nan,
@@ -210,6 +282,7 @@ def detect_market_regime(benchmark_df: pd.DataFrame) -> Dict[str, str]:
         }
 
     last = bench.iloc[-1]
+
     close = float(last["Close"])
     ema21 = float(last["EMA21"])
     ema50 = float(last["EMA50"])
@@ -217,10 +290,10 @@ def detect_market_regime(benchmark_df: pd.DataFrame) -> Dict[str, str]:
 
     if close > ema21 > ema50 and rsi >= 52:
         regime = "COMPRADOR"
-        reason = "Índice acima das médias e momentum positivo."
+        reason = "Índice acima das médias e com momentum positivo."
     elif close < ema21 < ema50 and rsi < 48:
         regime = "DEFENSIVO"
-        reason = "Índice abaixo das médias e momentum fraco."
+        reason = "Índice abaixo das médias e com momentum fraco."
     else:
         regime = "LATERAL"
         reason = "Mercado sem tendência clara."
@@ -235,17 +308,20 @@ def detect_market_regime(benchmark_df: pd.DataFrame) -> Dict[str, str]:
     }
 
 
-# =============================
-# Trade, risco e decisão
-# =============================
+# =========================================================
+# TRADE / RISCO
+# =========================================================
 def compute_trade_levels(data: pd.DataFrame) -> Dict[str, float]:
     last = data.iloc[-1]
+
     entry = float(last["Close"])
     atr = float(last["ATR14"])
     recent_support = float(last["Min10"])
 
     stop = max(recent_support, entry - 1.5 * atr)
-    stop = min(stop, entry * 0.9875) if stop >= entry else stop
+    if stop >= entry:
+        stop = entry * 0.9875
+
     risk = max(entry - stop, entry * 0.006)
     target = entry + (risk * 2.2)
     rr = (target - entry) / risk if risk > 0 else np.nan
@@ -267,7 +343,7 @@ def calculate_position_size(capital: float, risk_per_trade_pct: float, entry: fl
     if risk_per_share <= 0 or entry <= 0:
         return {
             "risk_amount": risk_amount,
-            "risk_per_share": risk_per_share,
+            "risk_per_share": 0,
             "qty": 0,
             "position_value": 0,
             "position_pct": 0,
@@ -275,7 +351,7 @@ def calculate_position_size(capital: float, risk_per_trade_pct: float, entry: fl
 
     qty = math.floor(risk_amount / risk_per_share)
     position_value = qty * entry
-    position_pct = (position_value / capital) if capital > 0 else 0
+    position_pct = position_value / capital if capital > 0 else 0
 
     return {
         "risk_amount": risk_amount,
@@ -310,8 +386,11 @@ def score_asset(
     rsi = float(last["RSI14"])
     rvol = float(last["RVOL"])
     vol = float(last["Volatilidade20"])
-    rs60 = float(last["ForcaRelativa60"]) if pd.notna(last["ForcaRelativa60"]) else np.nan
-    max20_prev = float(data["Max20"].shift(1).iloc[-1])
+
+    rs_value = last["ForcaRelativa"]
+    rs = float(rs_value) if pd.notna(rs_value) else np.nan
+
+    max20_prev = float(data["Max20"].shift(1).iloc[-1]) if len(data) > 1 else float(last["Max20"])
 
     if close > ema21 > ema50 > ema200:
         score += 30
@@ -360,13 +439,13 @@ def score_asset(
         score -= 8
         alertas.append("Volume fraco")
 
-    if pd.notna(rs60):
-        if rs60 > 0.08:
+    if pd.notna(rs):
+        if rs > 0.08:
             score += 12
             fortes.append("Força relativa forte")
-        elif rs60 > 0.02:
+        elif rs > 0.02:
             score += 6
-        elif rs60 < -0.03:
+        elif rs < -0.03:
             score -= 8
             alertas.append("Mais fraca que o índice")
 
@@ -447,7 +526,7 @@ def score_asset(
         "rsi": rsi,
         "rvol": rvol,
         "volatility": vol,
-        "relative_strength": rs60,
+        "relative_strength": rs,
         "entry": levels["entry"],
         "stop": levels["stop"],
         "target": levels["target"],
@@ -464,9 +543,9 @@ def score_asset(
     }
 
 
-# =============================
-# Ranking
-# =============================
+# =========================================================
+# RANKING + DIAGNÓSTICO
+# =========================================================
 def build_summary(
     tickers: List[str],
     intraday_period: str,
@@ -476,23 +555,50 @@ def build_summary(
     capital: float,
     risk_per_trade_pct: float,
     min_rr: float,
-) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, str]]:
+) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, str], pd.DataFrame]:
     rows = []
     data_map: Dict[str, pd.DataFrame] = {}
+    debug_rows = []
 
     intraday_bench = load_benchmark(intraday_period, intraday_interval, benchmark)
-    intraday_bench_close = intraday_bench.get("Close") if not intraday_bench.empty else pd.Series(dtype=float)
+    intraday_bench_close = intraday_bench["Close"] if not intraday_bench.empty else pd.Series(dtype=float)
 
     trend_bench = load_benchmark(trend_period, "1d", benchmark)
     regime_info = detect_market_regime(trend_bench)
 
     for ticker in tickers:
         raw = load_data(ticker, intraday_period, intraday_interval)
+
         if raw.empty:
+            debug_rows.append(
+                {
+                    "ticker": ticker.replace(".SA", ""),
+                    "status": "sem dados",
+                    "motivo": "Yahoo não retornou candles",
+                }
+            )
             continue
 
         enriched = calculate_indicators(raw, intraday_bench_close)
-        if len(enriched) < 30:
+
+        if enriched.empty:
+            debug_rows.append(
+                {
+                    "ticker": ticker.replace(".SA", ""),
+                    "status": "sem indicadores",
+                    "motivo": "dados insuficientes após indicadores",
+                }
+            )
+            continue
+
+        if len(enriched) < 15:
+            debug_rows.append(
+                {
+                    "ticker": ticker.replace(".SA", ""),
+                    "status": "poucos candles",
+                    "motivo": f"apenas {len(enriched)} candles válidos",
+                }
+            )
             continue
 
         scored = score_asset(
@@ -502,12 +608,23 @@ def build_summary(
             risk_per_trade_pct=risk_per_trade_pct,
             min_rr=min_rr,
         )
+
         scored["ticker"] = ticker.replace(".SA", "")
         rows.append(scored)
         data_map[ticker] = enriched
 
+        debug_rows.append(
+            {
+                "ticker": ticker.replace(".SA", ""),
+                "status": "ok",
+                "motivo": f"{len(enriched)} candles válidos",
+            }
+        )
+
+    debug_df = pd.DataFrame(debug_rows)
+
     if not rows:
-        return pd.DataFrame(), data_map, regime_info
+        return pd.DataFrame(), data_map, regime_info, debug_df
 
     summary = pd.DataFrame(rows)
     summary["ranking"] = (
@@ -517,12 +634,13 @@ def build_summary(
         - summary["volatility"].fillna(0) * 5
     )
     summary = summary.sort_values(["ranking", "score"], ascending=False).reset_index(drop=True)
-    return summary, data_map, regime_info
+
+    return summary, data_map, regime_info, debug_df
 
 
-# =============================
-# Alertas e gráfico
-# =============================
+# =========================================================
+# ALERTAS / GRÁFICO
+# =========================================================
 def check_price_alerts(close: float, above: Optional[float], below: Optional[float]) -> List[str]:
     alerts = []
     if above is not None and close >= above:
@@ -578,6 +696,7 @@ def build_chart(data: pd.DataFrame, title: str, entry: float, stop: float, targe
         row=1,
         col=1,
     )
+
     fig.add_hrect(
         y0=entry,
         y1=target,
@@ -599,29 +718,34 @@ def build_chart(data: pd.DataFrame, title: str, entry: float, stop: float, targe
     )
     fig.update_yaxes(title_text="Preço", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
+
     return fig
 
 
-# =============================
-# Interface
-# =============================
+# =========================================================
+# INTERFACE
+# =========================================================
 st.title("📈 Robô Pessoal de Análise de Ações — V3")
-st.caption("Foco em tendência, regime de mercado, risco por operação e decisão objetiva.")
+st.caption("Foco em tendência, regime de mercado, risco por operação decisão e objetiva.")
 
 with st.sidebar:
-    st.header("Configurações")
+    st.header("configurações")
+
     tickers_text = st.text_area(
         "Ativos monitorados (separados por vírgula)",
         value=DEFAULT_TICKERS,
         help="Ex.: PETR4, VALE3, BBAS3",
     )
+
     intraday_interval_label = st.selectbox("Intervalo intradia", list(INTERVAL_OPTIONS.keys()), index=1)
     intraday_period_label = st.selectbox("Período intradia", list(PERIOD_OPTIONS.keys()), index=0)
     trend_period_label = st.selectbox("Período diário para tendência maior", list(TREND_PERIOD_OPTIONS.keys()), index=0)
-    benchmark = st.text_input("Benchmark", value="^BVSP").strip().upper() or "^BVSP"
+
+    benchmark = st.text_input("Referência", value="^BVSP").strip().upper() or "^BVSP"
 
     st.divider()
     st.subheader("Gestão de risco")
+
     capital = st.number_input("Capital total (R$)", min_value=100.0, value=10000.0, step=100.0)
     risk_per_trade_pct = st.slider("Risco por operação (%)", 0.25, 3.0, 1.0, 0.25) / 100
     daily_loss_limit_pct = st.slider("Perda máxima no dia (%)", 1.0, 5.0, 2.0, 0.5) / 100
@@ -629,18 +753,22 @@ with st.sidebar:
     top_n = st.slider("Quantidade de sugestões", 1, 10, 3)
 
     st.divider()
+
     auto_refresh = st.checkbox("Atualização automática", value=False)
     refresh_seconds = st.slider("Atualizar a cada (segundos)", 30, 600, 120, 30)
     force_update = st.button("Atualizar agora", use_container_width=True)
 
     st.divider()
     st.subheader("Alertas do ativo selecionado")
+
     alert_above_text = st.text_input("Alertar se subir até", value="")
     alert_below_text = st.text_input("Alertar se cair até", value="")
+
 
 intraday_period = PERIOD_OPTIONS[intraday_period_label]
 intraday_interval = INTERVAL_OPTIONS[intraday_interval_label]
 trend_period = TREND_PERIOD_OPTIONS[trend_period_label]
+
 tickers = [normalize_ticker(t) for t in tickers_text.split(",")]
 tickers = [t for t in tickers if t]
 
@@ -659,7 +787,7 @@ if auto_refresh:
         height=0,
     )
 
-summary, data_map, regime_info = build_summary(
+summary, data_map, regime_info, debug_df = build_summary(
     tickers=tickers,
     intraday_period=intraday_period,
     intraday_interval=intraday_interval,
@@ -671,8 +799,16 @@ summary, data_map, regime_info = build_summary(
 )
 
 if summary.empty:
-    st.error("Não consegui montar a análise com os tickers informados. Verifique os códigos e tente novamente.")
+    st.error("O app abriu, mas nenhum ativo retornou dados válidos para esse intervalo/período.")
+    if not debug_df.empty:
+        st.dataframe(debug_df, use_container_width=True, hide_index=True)
     st.stop()
+
+if not debug_df.empty:
+    falhas = debug_df[debug_df["status"] != "ok"]
+    if not falhas.empty:
+        with st.expander("Ver ativos com problema"):
+            st.dataframe(falhas, use_container_width=True, hide_index=True)
 
 summary_top = summary.head(top_n).copy()
 
@@ -685,10 +821,12 @@ rc1.metric("Regime atual", f"{regime_icon} {regime_info['regime']}")
 rc2.metric("Benchmark", benchmark)
 rc3.metric("RSI do índice", f"{regime_info['rsi']:.1f}" if pd.notna(regime_info["rsi"]) else "-")
 rc4.metric("Perda máxima do dia", f"R$ {daily_loss_limit_value:,.2f}")
+
 st.caption(regime_info["reason"])
 
 best_row = summary.iloc[0]
 decision_icon = SIGNAL_COLORS.get(best_row["decision"], "•")
+
 st.markdown(
     f"### {decision_icon} Decisão final do melhor ativo: **{best_row['ticker']} — {best_row['decision']}**"
 )
@@ -698,6 +836,7 @@ st.caption(
 
 st.subheader("Top oportunidades")
 cols = st.columns(len(summary_top))
+
 for col, (_, row) in zip(cols, summary_top.iterrows()):
     signal_icon = SIGNAL_COLORS.get(row["decision"], "•")
     with col:
@@ -756,7 +895,7 @@ with st.expander("📋 Ver ranking completo"):
         "RSI",
         "RVOL",
         "Volatilidade",
-        "Força Relativa 60d",
+        "Força Relativa",
         "Fortes",
         "Alertas",
     ]
@@ -765,7 +904,7 @@ with st.expander("📋 Ver ranking completo"):
     display_df["Risco %"] = display_df["Risco %"].map(format_pct)
     display_df["Potencial %"] = display_df["Potencial %"].map(format_pct)
     display_df["Volatilidade"] = display_df["Volatilidade"].map(format_pct)
-    display_df["Força Relativa 60d"] = display_df["Força Relativa 60d"].map(format_pct)
+    display_df["Força Relativa"] = display_df["Força Relativa"].map(format_pct)
     display_df["RSI"] = display_df["RSI"].map(lambda x: f"{x:.1f}")
     display_df["RVOL"] = display_df["RVOL"].map(lambda x: f"{x:.2f}")
     display_df["Qtd"] = display_df["Qtd"].map(lambda x: int(x))
@@ -778,6 +917,7 @@ selected_label = st.selectbox(
     options=summary["ticker"].tolist(),
     index=0,
 )
+
 selected_ticker = normalize_ticker(selected_label)
 selected_row = summary.loc[summary["ticker"] == selected_label].iloc[0]
 selected_data = data_map[selected_ticker]
@@ -804,6 +944,7 @@ else:
     st.info("Nenhum alerta manual acionado no ativo selecionado.")
 
 st.subheader("Resumo operacional")
+
 a1, a2, a3, a4 = st.columns(4)
 a1.metric("Decisão", selected_row["decision"])
 a2.metric("Preço atual", f"R$ {selected_row['close']:.2f}")
@@ -814,7 +955,7 @@ b1, b2, b3, b4 = st.columns(4)
 b1.metric("RSI 14", f"{selected_row['rsi']:.1f}")
 b2.metric("RVOL", f"{selected_row['rvol']:.2f}")
 b3.metric("Volatilidade 20", format_pct(float(selected_row["volatility"])))
-b4.metric("Força Relativa 60d", format_pct(float(selected_row["relative_strength"])))
+b4.metric("Força Relativa", format_pct(float(selected_row["relative_strength"])) if pd.notna(selected_row["relative_strength"]) else "-")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Qtd sugerida", int(selected_row["qty"]))
@@ -839,4 +980,3 @@ with st.expander("Como o robô decide"):
     )
 
 st.caption("Uso educacional. Não é garantia de lucro e não substitui gerenciamento de risco e testes da estratégia.")
-
