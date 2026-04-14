@@ -416,6 +416,24 @@ def get_structure_settings(trigger_interval: str) -> Tuple[str, str]:
     return "1mo", "60m"
 
 
+def get_safe_backtest_period(backtest_period: str, trigger_interval: str) -> str:
+    if trigger_interval == "1d":
+        return backtest_period
+
+    ordered_periods = ["1mo", "3mo", "6mo", "1y"]
+    safe_caps = {
+        "5m": "1mo",
+        "15m": "1mo",
+        "30m": "1mo",
+        "60m": "3mo",
+    }
+
+    cap = safe_caps.get(trigger_interval, "1mo")
+    requested_idx = ordered_periods.index(backtest_period) if backtest_period in ordered_periods else 0
+    cap_idx = ordered_periods.index(cap)
+    return ordered_periods[min(requested_idx, cap_idx)]
+
+
 def evaluate_asset_from_indicator_frames(
     ticker: str,
     daily: pd.DataFrame,
@@ -832,22 +850,72 @@ def run_backtest(
     trades: List[Dict] = []
     debug_rows: List[Dict] = []
 
-    benchmark_daily = load_data(benchmark, backtest_period, "1d")
+    fetch_period = get_safe_backtest_period(backtest_period, trigger_interval)
+    benchmark_daily = load_data(benchmark, max(backtest_period, "3mo", key=lambda x: ["1mo", "3mo", "6mo", "1y"].index(x) if x in ["1mo", "3mo", "6mo", "1y"] else 0), "1d")
     benchmark_daily_close = benchmark_daily["Close"] if not benchmark_daily.empty else pd.Series(dtype=float)
     regime_table = build_regime_table(benchmark_daily)
 
-    structure_period, structure_interval = get_structure_settings(trigger_interval)
-    if structure_interval != "1d":
+    if trigger_interval == "1d":
+        structure_period, structure_interval = get_structure_settings(trigger_interval)
         structure_period = backtest_period
+    else:
+        structure_period, structure_interval = fetch_period, "60m"
 
     for ticker in tickers:
         try:
-            daily_raw = load_data(ticker, backtest_period, "1d")
+            daily_raw = load_data(ticker, max(backtest_period, "3mo", key=lambda x: ["1mo", "3mo", "6mo", "1y"].index(x) if x in ["1mo", "3mo", "6mo", "1y"] else 0), "1d")
             structure_raw = load_data(ticker, structure_period, structure_interval)
-            trigger_raw = load_data(ticker, backtest_period, trigger_interval)
+            trigger_raw = load_data(ticker, fetch_period, trigger_interval)
 
-            if daily_raw.empty or structure_raw.empty or trigger_raw.empty:
-                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "dados insuficientes para backtest"})
+            missing_frames = []
+            if daily_raw.empty:
+                missing_frames.append("diário")
+            if structure_raw.empty:
+                missing_frames.append(f"estrutura {structure_interval}")
+            if trigger_raw.empty:
+                missing_frames.append(f"gatilho {trigger_interval}")
+
+            if missing_frames:
+                extra = ""
+                if fetch_period != backtest_period and trigger_interval != "1d":
+                    extra = f" | janela pedida: {backtest_period}, janela usada no intraday: {fetch_period}"
+                debug_rows.append(
+                    {
+                        "ticker": ticker.replace(".SA", ""),
+                        "status": "erro",
+                        "motivo": f"sem dados em: {', '.join(missing_frames)}{extra}",
+                    }
+                )
+                continue
+
+            if len(daily_raw) < 60:
+                debug_rows.append(
+                    {
+                        "ticker": ticker.replace(".SA", ""),
+                        "status": "erro",
+                        "motivo": f"poucos candles no diário: {len(daily_raw)}",
+                    }
+                )
+                continue
+
+            if len(structure_raw) < 40:
+                debug_rows.append(
+                    {
+                        "ticker": ticker.replace(".SA", ""),
+                        "status": "erro",
+                        "motivo": f"poucos candles na estrutura {structure_interval}: {len(structure_raw)}",
+                    }
+                )
+                continue
+
+            if len(trigger_raw) < 80:
+                debug_rows.append(
+                    {
+                        "ticker": ticker.replace(".SA", ""),
+                        "status": "erro",
+                        "motivo": f"poucos candles no gatilho {trigger_interval}: {len(trigger_raw)}",
+                    }
+                )
                 continue
 
             daily_ind = add_indicators(daily_raw, "1d", benchmark_daily_close)
@@ -855,7 +923,20 @@ def run_backtest(
             trigger_ind = add_indicators(trigger_raw, trigger_interval, None)
 
             if daily_ind.empty or structure_ind.empty or trigger_ind.empty:
-                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "indicadores insuficientes para backtest"})
+                empty_parts = []
+                if daily_ind.empty:
+                    empty_parts.append("diário")
+                if structure_ind.empty:
+                    empty_parts.append(f"estrutura {structure_interval}")
+                if trigger_ind.empty:
+                    empty_parts.append(f"gatilho {trigger_interval}")
+                debug_rows.append(
+                    {
+                        "ticker": ticker.replace(".SA", ""),
+                        "status": "erro",
+                        "motivo": f"indicadores insuficientes em: {', '.join(empty_parts)}",
+                    }
+                )
                 continue
 
             i = 0
@@ -932,7 +1013,22 @@ def run_backtest(
                 trades_count += 1
                 i = exit_idx + 1
 
-            debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "ok", "motivo": f"{trades_count} trades no backtest"})
+            if trades_count == 0:
+                debug_rows.append(
+                    {
+                        "ticker": ticker.replace(".SA", ""),
+                        "status": "sem trades",
+                        "motivo": "os dados existem, mas nenhuma barra passou por todos os filtros de OPERAR AGORA",
+                    }
+                )
+            else:
+                debug_rows.append(
+                    {
+                        "ticker": ticker.replace(".SA", ""),
+                        "status": "ok",
+                        "motivo": f"{trades_count} trades no backtest",
+                    }
+                )
 
         except Exception as e:
             debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": str(e)})
