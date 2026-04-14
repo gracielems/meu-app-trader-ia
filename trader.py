@@ -1,4 +1,5 @@
 import math
+from datetime import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -11,7 +12,7 @@ import yfinance as yf
 
 
 st.set_page_config(
-    page_title="Robô Pessoal de Análise de Ações — V5",
+    page_title="Robô Pessoal de Análise de Ações — V6",
     page_icon="📈",
     layout="wide",
 )
@@ -44,6 +45,9 @@ BACKTEST_PERIOD_OPTIONS = {
     "6 meses": "6mo",
     "1 ano": "1y",
 }
+
+PERIOD_ORDER = ["5d", "1mo", "3mo", "6mo", "1y", "2y"]
+TIME_CHOICES = [f"{h:02d}:{m:02d}" for h in range(9, 19) for m in range(0, 60, 5)]
 
 SIGNAL_COLORS = {
     "OPERAR AGORA": "🟢",
@@ -94,8 +98,61 @@ def format_money(value: float) -> str:
     return f"R$ {value:,.2f}"
 
 
-def interval_label_to_code(label: str) -> str:
-    return TRIGGER_INTERVAL_OPTIONS.get(label, label)
+def at_least_period(requested: str, minimum: str) -> str:
+    req_idx = PERIOD_ORDER.index(requested) if requested in PERIOD_ORDER else 0
+    min_idx = PERIOD_ORDER.index(minimum) if minimum in PERIOD_ORDER else 0
+    return PERIOD_ORDER[max(req_idx, min_idx)]
+
+
+def get_safe_backtest_period(backtest_period: str, trigger_interval: str) -> str:
+    if trigger_interval == "1d":
+        return backtest_period
+
+    safe_caps = {
+        "5m": "1mo",
+        "15m": "1mo",
+        "30m": "1mo",
+        "60m": "3mo",
+    }
+    cap = safe_caps.get(trigger_interval, "1mo")
+    req_idx = PERIOD_ORDER.index(backtest_period) if backtest_period in PERIOD_ORDER else 1
+    cap_idx = PERIOD_ORDER.index(cap)
+    return PERIOD_ORDER[min(req_idx, cap_idx)]
+
+
+def parse_hhmm(value: str) -> time:
+    h, m = value.split(":")
+    return time(int(h), int(m))
+
+
+def build_allowed_windows(
+    use_time_filter: bool,
+    morning_window: Tuple[str, str],
+    afternoon_window: Tuple[str, str],
+    use_afternoon: bool,
+) -> List[Tuple[time, time]]:
+    if not use_time_filter:
+        return []
+
+    windows = [(parse_hhmm(morning_window[0]), parse_hhmm(morning_window[1]))]
+    if use_afternoon:
+        windows.append((parse_hhmm(afternoon_window[0]), parse_hhmm(afternoon_window[1])))
+    return windows
+
+
+def within_any_window(ts, windows: List[Tuple[time, time]]) -> bool:
+    if not windows:
+        return True
+
+    current = pd.Timestamp(ts)
+    if current.tzinfo is not None:
+        current = current.tz_localize(None)
+    current_t = current.time()
+
+    for start, end in windows:
+        if start <= current_t <= end:
+            return True
+    return False
 
 
 # =========================================================
@@ -151,9 +208,9 @@ def load_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
         tentativas.append(pd.DataFrame())
 
     for df in tentativas:
-        preparado = _prepare_ohlcv(df)
-        if not preparado.empty:
-            return preparado
+        prepared = _prepare_ohlcv(df)
+        if not prepared.empty:
+            return prepared
 
     return pd.DataFrame()
 
@@ -175,19 +232,21 @@ def calculate_rsi(close: pd.Series, window: int = 14) -> pd.Series:
 
 
 def add_session_vwap(data: pd.DataFrame) -> pd.Series:
-    if data.empty:
-        return pd.Series(dtype=float)
-
     idx = pd.to_datetime(data.index)
     session_key = pd.Series(idx.date, index=data.index)
-
     typical_price = (data["High"] + data["Low"] + data["Close"]) / 3
     tpv = typical_price * data["Volume"]
-
     cum_tpv = tpv.groupby(session_key).cumsum()
     cum_vol = data["Volume"].groupby(session_key).cumsum().replace(0, np.nan)
-
     return cum_tpv / cum_vol
+
+
+def add_intraday_rvol_clock(data: pd.DataFrame) -> pd.Series:
+    idx = pd.to_datetime(data.index)
+    slot = idx.strftime("%H:%M")
+    series = data["Volume"].copy()
+    same_slot_avg = series.groupby(slot).transform(lambda s: s.shift(1).rolling(10, min_periods=3).mean())
+    return series / same_slot_avg.replace(0, np.nan)
 
 
 def add_indicators(
@@ -221,25 +280,26 @@ def add_indicators(
     data["Max20"] = data["High"].rolling(20).max()
     data["Min20"] = data["Low"].rolling(20).min()
     data["Min10"] = data["Low"].rolling(10).min()
-
     data["ValorFinanceiroMedio"] = data["Close"] * data["VolumeMA20"]
+
+    body = (data["Close"] - data["Open"]).abs()
+    range_ = (data["High"] - data["Low"]).replace(0, np.nan)
+    upper_wick = data["High"] - data[["Open", "Close"]].max(axis=1)
+    data["BODY_FRAC"] = body / range_
+    data["CLOSE_TO_HIGH"] = (data["High"] - data["Close"]) / range_
+    data["BULL_CANDLE"] = (data["Close"] > data["Open"]).astype(int)
 
     if interval != "1d":
         data["VWAP"] = add_session_vwap(data)
+        data["RVOL_CLOCK"] = add_intraday_rvol_clock(data)
     else:
         data["VWAP"] = np.nan
+        data["RVOL_CLOCK"] = np.nan
 
     data["ForcaRelativa"] = np.nan
     if benchmark_close is not None and not benchmark_close.empty:
         aligned_bench = benchmark_close.reindex(data.index).ffill().bfill()
-
-        if len(data) >= 60:
-            lookback = 20
-        elif len(data) >= 30:
-            lookback = 10
-        else:
-            lookback = 5
-
+        lookback = 20 if len(data) >= 60 else 10 if len(data) >= 30 else 5
         asset_ret = data["Close"].pct_change(lookback)
         bench_ret = aligned_bench.pct_change(lookback)
         data["ForcaRelativa"] = asset_ret - bench_ret
@@ -257,6 +317,8 @@ def add_indicators(
         "Min20",
         "Min10",
         "ValorFinanceiroMedio",
+        "BODY_FRAC",
+        "CLOSE_TO_HIGH",
     ]
 
     if interval != "1d":
@@ -277,10 +339,10 @@ def build_regime_table(benchmark_df: pd.DataFrame) -> pd.DataFrame:
     bench["EMA21"] = bench["Close"].ewm(span=21, adjust=False).mean()
     bench["EMA50"] = bench["Close"].ewm(span=50, adjust=False).mean()
     bench["RSI14"] = calculate_rsi(bench["Close"], 14)
-    bench["RET20"] = bench["Close"].pct_change(20)
+    bench["RET20"] = bench["Close"] .pct_change(20)
 
-    regime = []
-    reason = []
+    regimes = []
+    reasons = []
     for _, row in bench.iterrows():
         close = row["Close"]
         ema21 = row["EMA21"]
@@ -289,20 +351,20 @@ def build_regime_table(benchmark_df: pd.DataFrame) -> pd.DataFrame:
         ret20 = row["RET20"]
 
         if pd.isna(ema21) or pd.isna(ema50) or pd.isna(rsi) or pd.isna(ret20):
-            regime.append("LATERAL")
-            reason.append("Índice com poucos dados para confirmar tendência.")
+            regimes.append("LATERAL")
+            reasons.append("Índice com poucos dados para confirmar tendência.")
         elif close > ema21 > ema50 and rsi >= 52 and ret20 > 0:
-            regime.append("COMPRADOR")
-            reason.append("Índice acima da EMA21/EMA50, RSI positivo e retorno recente positivo.")
+            regimes.append("COMPRADOR")
+            reasons.append("Índice acima da EMA21/EMA50, RSI positivo e retorno recente positivo.")
         elif close < ema21 < ema50 and rsi < 48 and ret20 < 0:
-            regime.append("DEFENSIVO")
-            reason.append("Índice abaixo da EMA21/EMA50, RSI fraco e retorno recente negativo.")
+            regimes.append("DEFENSIVO")
+            reasons.append("Índice abaixo da EMA21/EMA50, RSI fraco e retorno recente negativo.")
         else:
-            regime.append("LATERAL")
-            reason.append("Mercado sem alinhamento claro de tendência.")
+            regimes.append("LATERAL")
+            reasons.append("Mercado sem alinhamento claro de tendência.")
 
-    bench["REGIME"] = regime
-    bench["REASON"] = reason
+    bench["REGIME"] = regimes
+    bench["REASON"] = reasons
     return bench
 
 
@@ -318,21 +380,17 @@ def get_regime_info_at(regime_table: pd.DataFrame, timestamp) -> Dict[str, float
             "ret20": np.nan,
         }
 
-    regime_table = regime_table.copy()
-    regime_table.index = pd.to_datetime(regime_table.index, errors="coerce")
-    regime_table = regime_table[~regime_table.index.isna()].sort_index()
+    table = regime_table.copy()
+    table.index = pd.to_datetime(table.index, errors="coerce")
+    table = table[~table.index.isna()].sort_index()
 
     ts = pd.Timestamp(timestamp)
     if ts.tzinfo is not None:
         ts = ts.tz_localize(None)
     ts = pd.Timestamp(ts.to_datetime64())
 
-    idx = pd.DatetimeIndex(regime_table.index)
-    subset = regime_table.loc[idx <= ts]
-    if subset.empty:
-        row = regime_table.iloc[0]
-    else:
-        row = subset.iloc[-1]
+    subset = table.loc[table.index <= ts]
+    row = table.iloc[0] if subset.empty else subset.iloc[-1]
 
     return {
         "regime": row.get("REGIME", "LATERAL"),
@@ -346,11 +404,10 @@ def get_regime_info_at(regime_table: pd.DataFrame, timestamp) -> Dict[str, float
 
 
 # =========================================================
-# RISCO E TAMANHO DE POSIÇÃO
+# RISCO
 # =========================================================
 def compute_trade_levels(trigger_data: pd.DataFrame) -> Dict[str, float]:
     last = trigger_data.iloc[-1]
-
     entry = float(last["Close"])
     atr = float(last["ATR14"])
     recent_support = float(last["Min10"])
@@ -361,17 +418,17 @@ def compute_trade_levels(trigger_data: pd.DataFrame) -> Dict[str, float]:
         stop = entry * 0.9875
 
     risk = max(entry - stop, entry * 0.006)
-
     target_base = entry + (risk * 2.2)
     target_resistance = max(breakout_ref, entry + 1.2 * atr)
     target = max(target_base, target_resistance)
-
+    partial = entry + risk * 1.0
     rr = (target - entry) / risk if risk > 0 else np.nan
 
     return {
         "entry": entry,
         "stop": stop,
         "target": target,
+        "partial": partial,
         "risk": risk,
         "rr": rr,
     }
@@ -392,9 +449,6 @@ def calculate_position_size(
         return {
             "risk_amount": risk_amount,
             "risk_per_share": risk_per_share,
-            "qty_risco": 0,
-            "qty_caixa": 0,
-            "qty_exposicao": 0,
             "qty": 0,
             "position_value": 0,
             "position_pct": 0,
@@ -403,9 +457,7 @@ def calculate_position_size(
     qty_risco = math.floor(risk_amount / risk_per_share)
     qty_caixa = math.floor(capital / entry)
     qty_exposicao = math.floor((capital * max_position_pct) / entry)
-
-    qty_final = min(qty_risco, qty_caixa, qty_exposicao)
-    qty_final = max(qty_final, 0)
+    qty_final = max(min(qty_risco, qty_caixa, qty_exposicao), 0)
 
     position_value = qty_final * entry
     position_pct = position_value / capital if capital > 0 else 0
@@ -413,9 +465,6 @@ def calculate_position_size(
     return {
         "risk_amount": risk_amount,
         "risk_per_share": risk_per_share,
-        "qty_risco": qty_risco,
-        "qty_caixa": qty_caixa,
-        "qty_exposicao": qty_exposicao,
         "qty": qty_final,
         "position_value": position_value,
         "position_pct": position_pct,
@@ -423,7 +472,7 @@ def calculate_position_size(
 
 
 # =========================================================
-# LÓGICA PRINCIPAL
+# LÓGICA DO SETUP
 # =========================================================
 def get_structure_settings(trigger_interval: str) -> Tuple[str, str]:
     if trigger_interval == "1d":
@@ -431,22 +480,13 @@ def get_structure_settings(trigger_interval: str) -> Tuple[str, str]:
     return "1mo", "60m"
 
 
-def get_safe_backtest_period(backtest_period: str, trigger_interval: str) -> str:
-    if trigger_interval == "1d":
-        return backtest_period
-
-    ordered_periods = ["1mo", "3mo", "6mo", "1y"]
-    safe_caps = {
-        "5m": "1mo",
-        "15m": "1mo",
-        "30m": "1mo",
-        "60m": "3mo",
-    }
-
-    cap = safe_caps.get(trigger_interval, "1mo")
-    requested_idx = ordered_periods.index(backtest_period) if backtest_period in ordered_periods else 0
-    cap_idx = ordered_periods.index(cap)
-    return ordered_periods[min(requested_idx, cap_idx)]
+def effective_rvol(trigger_row: pd.Series, interval: str) -> float:
+    if interval == "1d":
+        return float(trigger_row["RVOL"])
+    clock = trigger_row.get("RVOL_CLOCK", np.nan)
+    if pd.notna(clock):
+        return float(clock)
+    return float(trigger_row["RVOL"])
 
 
 def evaluate_asset_from_indicator_frames(
@@ -465,14 +505,10 @@ def evaluate_asset_from_indicator_frames(
     entry_max_rsi: float,
     entry_min_score: float,
     require_breakout: bool,
+    require_strong_candle: bool,
+    allowed_windows: List[Tuple[time, time]],
+    trigger_interval: str,
 ) -> Dict[str, float]:
-    if daily.empty:
-        raise ValueError("diário sem indicadores")
-    if structure.empty:
-        raise ValueError("estrutura sem indicadores")
-    if trigger.empty:
-        raise ValueError("gatilho sem indicadores")
-
     d = daily.iloc[-1]
     s = structure.iloc[-1]
     t = trigger.iloc[-1]
@@ -497,20 +533,24 @@ def evaluate_asset_from_indicator_frames(
 
     daily_ema21 = float(d["EMA21"])
     daily_ema50 = float(d["EMA50"])
-
     structure_ema9 = float(s["EMA9"])
     structure_ema21 = float(s["EMA21"])
-
     trigger_ema9 = float(t["EMA9"])
     trigger_ema21 = float(t["EMA21"])
     trigger_vwap = float(t["VWAP"]) if pd.notna(t["VWAP"]) else np.nan
-    prev_trigger_high = float(trigger.iloc[-2]["High"]) if len(trigger) >= 2 else close_trigger
-    breakout_ok = close_trigger > prev_trigger_high
     trigger_rsi = float(t["RSI14"])
-    trigger_rvol = float(t["RVOL"])
+    trigger_rvol = effective_rvol(t, trigger_interval)
     trigger_vol = float(t["Volatilidade20"])
     liquidity_value = float(t["ValorFinanceiroMedio"])
     rel_strength = float(d["ForcaRelativa"]) if pd.notna(d["ForcaRelativa"]) else np.nan
+    body_frac = float(t["BODY_FRAC"])
+    close_to_high = float(t["CLOSE_TO_HIGH"])
+    bull_candle = bool(int(t["BULL_CANDLE"]))
+
+    prev_trigger_high = float(trigger.iloc[-2]["High"]) if len(trigger) >= 2 else close_trigger
+    breakout_ok = close_trigger > prev_trigger_high
+    strong_candle = bull_candle and body_frac >= 0.55 and close_to_high <= 0.25
+    time_ok = True if trigger_interval == "1d" else within_any_window(trigger.index[-1], allowed_windows)
 
     stop_pct = (levels["entry"] - levels["stop"]) / levels["entry"] if levels["entry"] > 0 else np.nan
     upside_pct = (levels["target"] - levels["entry"]) / levels["entry"] if levels["entry"] > 0 else np.nan
@@ -571,18 +611,25 @@ def evaluate_asset_from_indicator_frames(
         score -= 4
         alerts.append("Sem rompimento de curto prazo")
 
+    if strong_candle:
+        score += 8
+        strengths.append("Candle de força")
+    else:
+        score -= 5
+        alerts.append("Candle sem força")
+
     if 54 <= trigger_rsi <= 68:
         score += 10
         strengths.append("Momentum saudável")
-    elif 68 < trigger_rsi <= 75:
-        score += 4
+    elif 68 < trigger_rsi <= entry_max_rsi:
+        score += 2
         alerts.append("Levemente esticada")
     elif trigger_rsi < 45:
         score -= 8
         alerts.append("RSI fraco")
-    elif trigger_rsi > 80:
-        score -= 12
-        alerts.append("Muito esticada")
+    elif trigger_rsi > entry_max_rsi:
+        score -= 15
+        alerts.append("RSI esticado")
 
     if trigger_rvol >= 1.5:
         score += 12
@@ -639,6 +686,8 @@ def evaluate_asset_from_indicator_frames(
         score -= 18
         alerts.append("Liquidez fraca")
 
+    if not time_ok:
+        hard_blocks.append("Fora da janela de horário")
     if regime_info["regime"] == "DEFENSIVO":
         hard_blocks.append("Mercado defensivo")
     if close_daily <= daily_ema21:
@@ -655,6 +704,8 @@ def evaluate_asset_from_indicator_frames(
         hard_blocks.append(f"RSI acima de {entry_max_rsi:.0f}")
     if require_breakout and not breakout_ok:
         hard_blocks.append("Sem rompimento confirmado")
+    if require_strong_candle and not strong_candle:
+        hard_blocks.append("Candle sem força")
     if levels["rr"] < min_rr:
         hard_blocks.append("Risco/retorno abaixo do mínimo")
     if pd.notna(upside_pct) and upside_pct < min_upside_pct:
@@ -674,9 +725,9 @@ def evaluate_asset_from_indicator_frames(
 
     if hard_blocks:
         decision = "NÃO OPERAR"
-    elif score >= 80:
+    elif score >= 90:
         decision = "OPERAR AGORA"
-    elif score >= 60:
+    elif score >= 70:
         decision = "OBSERVAR"
     else:
         decision = "NÃO OPERAR"
@@ -690,6 +741,7 @@ def evaluate_asset_from_indicator_frames(
         "entry": levels["entry"],
         "stop": levels["stop"],
         "target": levels["target"],
+        "partial": levels["partial"],
         "risk_reward": levels["rr"],
         "stop_pct": stop_pct,
         "upside_pct": upside_pct,
@@ -703,18 +755,15 @@ def evaluate_asset_from_indicator_frames(
         "position_pct": position["position_pct"],
         "risk_amount": position["risk_amount"],
         "risk_per_share": position["risk_per_share"],
-        "qty_risco": position["qty_risco"],
-        "qty_caixa": position["qty_caixa"],
-        "qty_exposicao": position["qty_exposicao"],
-        "strengths": " | ".join(strengths[:6]) if strengths else "Sem destaques",
-        "alerts": " | ".join(alerts[:6]) if alerts else "Sem alertas",
+        "strengths": " | ".join(strengths[:7]) if strengths else "Sem destaques",
+        "alerts": " | ".join(alerts[:7]) if alerts else "Sem alertas",
         "hard_blocks": " | ".join(hard_blocks) if hard_blocks else "Sem bloqueios",
+        "strong_candle": strong_candle,
+        "breakout_ok": breakout_ok,
+        "time_ok": time_ok,
     }
 
 
-# =========================================================
-# RESUMO GERAL
-# =========================================================
 def build_summary(
     tickers: List[str],
     trigger_period: str,
@@ -731,6 +780,8 @@ def build_summary(
     entry_max_rsi: float,
     entry_min_score: float,
     require_breakout: bool,
+    require_strong_candle: bool,
+    allowed_windows: List[Tuple[time, time]],
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, float], pd.DataFrame]:
     rows = []
     chart_map: Dict[str, pd.DataFrame] = {}
@@ -749,19 +800,17 @@ def build_summary(
             structure_raw = load_data(ticker, structure_period, structure_interval)
             trigger_raw = load_data(ticker, trigger_period, trigger_interval)
 
-            if daily_raw.empty:
-                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no diário"})
-                continue
-            if structure_raw.empty:
-                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no timeframe de estrutura"})
-                continue
-            if trigger_raw.empty:
-                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no timeframe de gatilho"})
+            if daily_raw.empty or structure_raw.empty or trigger_raw.empty:
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "dados insuficientes"})
                 continue
 
             daily_ind = add_indicators(daily_raw, "1d", benchmark_daily_close)
             structure_ind = add_indicators(structure_raw, structure_interval, None)
             trigger_ind = add_indicators(trigger_raw, trigger_interval, None)
+
+            if daily_ind.empty or structure_ind.empty or trigger_ind.empty:
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "indicadores insuficientes"})
+                continue
 
             evaluated = evaluate_asset_from_indicator_frames(
                 ticker=ticker,
@@ -779,45 +828,33 @@ def build_summary(
                 entry_max_rsi=entry_max_rsi,
                 entry_min_score=entry_min_score,
                 require_breakout=require_breakout,
+                require_strong_candle=require_strong_candle,
+                allowed_windows=allowed_windows,
+                trigger_interval=trigger_interval,
             )
 
             rows.append(evaluated)
             chart_map[ticker] = trigger_ind
-
-            debug_rows.append(
-                {
-                    "ticker": ticker.replace(".SA", ""),
-                    "status": "ok" if evaluated["decision"] != "NÃO OPERAR" else "bloqueado",
-                    "motivo": evaluated["hard_blocks"],
-                }
-            )
+            debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "ok" if evaluated["decision"] != "NÃO OPERAR" else "bloqueado", "motivo": evaluated["hard_blocks"]})
 
         except Exception as e:
             debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": str(e)})
 
     debug_df = pd.DataFrame(debug_rows)
-
     if not rows:
         return pd.DataFrame(), chart_map, regime_info, debug_df
 
     summary = pd.DataFrame(rows)
-
     decision_order = {"OPERAR AGORA": 0, "OBSERVAR": 1, "NÃO OPERAR": 2}
     summary["decision_order"] = summary["decision"].map(decision_order).fillna(9)
-
     summary["ranking"] = (
         summary["score"]
         + summary["upside_pct"].fillna(0) * 100
         - summary["stop_pct"].fillna(0) * 50
         + summary["relative_strength"].fillna(0) * 100
-        + (summary["rvol"].fillna(0) * 4)
+        + summary["rvol"].fillna(0) * 5
     )
-
-    summary = summary.sort_values(
-        by=["decision_order", "ranking", "score"],
-        ascending=[True, False, False],
-    ).reset_index(drop=True)
-
+    summary = summary.sort_values(by=["decision_order", "ranking", "score"], ascending=[True, False, False]).reset_index(drop=True)
     return summary, chart_map, regime_info, debug_df
 
 
@@ -829,11 +866,13 @@ def simulate_trade_path(
     start_idx: int,
     entry: float,
     stop: float,
+    partial: float,
     target: float,
     qty: int,
     max_hold_bars: int,
     total_cost_pct: float,
     breakeven_r: float,
+    partial_size_pct: float,
 ) -> Tuple[int, float, str, float]:
     end_idx = min(start_idx + max_hold_bars, len(trigger_ind) - 1)
     if end_idx <= start_idx:
@@ -843,14 +882,19 @@ def simulate_trade_path(
         pnl = (exit_price - entry) * qty - costs
         return start_idx, exit_price, "sem barras futuras", pnl
 
-    exit_idx = end_idx
-    exit_price = float(trigger_ind.iloc[end_idx]["Close"])
-    reason = "tempo esgotado"
-
     risk_per_share = max(entry - stop, 0)
-    be_trigger = entry + (risk_per_share * breakeven_r)
+    be_trigger = entry + risk_per_share * breakeven_r
     stop_level = stop
     breakeven_armed = False
+    partial_taken = False
+    remaining_qty = qty
+    partial_qty = 0
+    exit_turnover = 0.0
+    realized_gross = 0.0
+
+    exit_idx = end_idx
+    final_exit_price = float(trigger_ind.iloc[end_idx]["Close"])
+    reason = "tempo esgotado"
 
     for j in range(start_idx + 1, end_idx + 1):
         row = trigger_ind.iloc[j]
@@ -858,35 +902,44 @@ def simulate_trade_path(
         low = float(row["Low"])
         close = float(row["Close"])
 
-        if low <= stop_level and high >= target:
-            exit_idx = j
-            exit_price = stop_level
-            reason = "ambíguo, assumido stop/breakeven"
-            break
-
         if low <= stop_level:
             exit_idx = j
-            exit_price = stop_level
+            final_exit_price = stop_level
             reason = "breakeven" if breakeven_armed and stop_level >= entry else "stop"
             break
 
-        if high >= target:
-            exit_idx = j
-            exit_price = target
-            reason = "alvo"
-            break
+        if (not partial_taken) and high >= partial and qty > 1:
+            partial_qty = max(1, int(qty * partial_size_pct))
+            partial_qty = min(partial_qty, remaining_qty - 1) if remaining_qty > 1 else 0
+            if partial_qty > 0:
+                partial_taken = True
+                remaining_qty -= partial_qty
+                realized_gross += (partial - entry) * partial_qty
+                exit_turnover += partial * partial_qty
+                reason = "parcial"
+                if breakeven_r <= 1.0:
+                    breakeven_armed = True
+                    stop_level = entry
 
         if (not breakeven_armed) and risk_per_share > 0 and high >= be_trigger:
             breakeven_armed = True
             stop_level = entry
 
-        exit_idx = j
-        exit_price = close
+        if high >= target:
+            exit_idx = j
+            final_exit_price = target
+            reason = "alvo"
+            break
 
-    turnover = qty * (entry + exit_price)
+        exit_idx = j
+        final_exit_price = close
+
+    exit_turnover += final_exit_price * remaining_qty
+    turnover = qty * entry + exit_turnover
     costs = turnover * total_cost_pct
-    pnl = (exit_price - entry) * qty - costs
-    return exit_idx, exit_price, reason, pnl
+    gross = realized_gross + (final_exit_price - entry) * remaining_qty
+    pnl = gross - costs
+    return exit_idx, final_exit_price, reason, pnl
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -907,77 +960,33 @@ def run_backtest(
     entry_max_rsi: float,
     entry_min_score: float,
     require_breakout: bool,
+    require_strong_candle: bool,
+    allowed_windows: List[Tuple[time, time]],
     breakeven_r: float,
+    partial_size_pct: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     trades: List[Dict] = []
     debug_rows: List[Dict] = []
 
     fetch_period = get_safe_backtest_period(backtest_period, trigger_interval)
-    benchmark_daily = load_data(benchmark, max(backtest_period, "3mo", key=lambda x: ["1mo", "3mo", "6mo", "1y"].index(x) if x in ["1mo", "3mo", "6mo", "1y"] else 0), "1d")
+    daily_period = at_least_period(backtest_period, "6mo")
+
+    benchmark_daily = load_data(benchmark, daily_period, "1d")
     benchmark_daily_close = benchmark_daily["Close"] if not benchmark_daily.empty else pd.Series(dtype=float)
     regime_table = build_regime_table(benchmark_daily)
 
-    if trigger_interval == "1d":
-        structure_period, structure_interval = get_structure_settings(trigger_interval)
-        structure_period = backtest_period
-    else:
-        structure_period, structure_interval = fetch_period, "60m"
+    structure_period, structure_interval = get_structure_settings(trigger_interval)
+    if trigger_interval != "1d":
+        structure_period = fetch_period if structure_interval == "60m" else daily_period
 
     for ticker in tickers:
         try:
-            daily_raw = load_data(ticker, max(backtest_period, "3mo", key=lambda x: ["1mo", "3mo", "6mo", "1y"].index(x) if x in ["1mo", "3mo", "6mo", "1y"] else 0), "1d")
+            daily_raw = load_data(ticker, daily_period, "1d")
             structure_raw = load_data(ticker, structure_period, structure_interval)
-            trigger_raw = load_data(ticker, fetch_period, trigger_interval)
+            trigger_raw = load_data(ticker, fetch_period if trigger_interval != "1d" else backtest_period, trigger_interval)
 
-            missing_frames = []
-            if daily_raw.empty:
-                missing_frames.append("diário")
-            if structure_raw.empty:
-                missing_frames.append(f"estrutura {structure_interval}")
-            if trigger_raw.empty:
-                missing_frames.append(f"gatilho {trigger_interval}")
-
-            if missing_frames:
-                extra = ""
-                if fetch_period != backtest_period and trigger_interval != "1d":
-                    extra = f" | janela pedida: {backtest_period}, janela usada no intraday: {fetch_period}"
-                debug_rows.append(
-                    {
-                        "ticker": ticker.replace(".SA", ""),
-                        "status": "erro",
-                        "motivo": f"sem dados em: {', '.join(missing_frames)}{extra}",
-                    }
-                )
-                continue
-
-            if len(daily_raw) < 60:
-                debug_rows.append(
-                    {
-                        "ticker": ticker.replace(".SA", ""),
-                        "status": "erro",
-                        "motivo": f"poucos candles no diário: {len(daily_raw)}",
-                    }
-                )
-                continue
-
-            if len(structure_raw) < 40:
-                debug_rows.append(
-                    {
-                        "ticker": ticker.replace(".SA", ""),
-                        "status": "erro",
-                        "motivo": f"poucos candles na estrutura {structure_interval}: {len(structure_raw)}",
-                    }
-                )
-                continue
-
-            if len(trigger_raw) < 80:
-                debug_rows.append(
-                    {
-                        "ticker": ticker.replace(".SA", ""),
-                        "status": "erro",
-                        "motivo": f"poucos candles no gatilho {trigger_interval}: {len(trigger_raw)}",
-                    }
-                )
+            if daily_raw.empty or structure_raw.empty or trigger_raw.empty:
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "dados insuficientes para backtest"})
                 continue
 
             daily_ind = add_indicators(daily_raw, "1d", benchmark_daily_close)
@@ -985,23 +994,10 @@ def run_backtest(
             trigger_ind = add_indicators(trigger_raw, trigger_interval, None)
 
             if daily_ind.empty or structure_ind.empty or trigger_ind.empty:
-                empty_parts = []
-                if daily_ind.empty:
-                    empty_parts.append("diário")
-                if structure_ind.empty:
-                    empty_parts.append(f"estrutura {structure_interval}")
-                if trigger_ind.empty:
-                    empty_parts.append(f"gatilho {trigger_interval}")
-                debug_rows.append(
-                    {
-                        "ticker": ticker.replace(".SA", ""),
-                        "status": "erro",
-                        "motivo": f"indicadores insuficientes em: {', '.join(empty_parts)}",
-                    }
-                )
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "indicadores insuficientes para backtest"})
                 continue
 
-            i = 0
+            i = 20
             trades_count = 0
             while i < len(trigger_ind) - 1:
                 ts = pd.Timestamp(trigger_ind.index[i])
@@ -1030,6 +1026,9 @@ def run_backtest(
                     entry_max_rsi=entry_max_rsi,
                     entry_min_score=entry_min_score,
                     require_breakout=require_breakout,
+                    require_strong_candle=require_strong_candle,
+                    allowed_windows=allowed_windows,
+                    trigger_interval=trigger_interval,
                 )
 
                 if evaluated["decision"] != "OPERAR AGORA":
@@ -1043,6 +1042,7 @@ def run_backtest(
 
                 entry = float(evaluated["entry"])
                 stop = float(evaluated["stop"])
+                partial = float(evaluated["partial"])
                 target = float(evaluated["target"])
                 risk_amount = float(evaluated["risk_amount"])
 
@@ -1051,11 +1051,13 @@ def run_backtest(
                     start_idx=i,
                     entry=entry,
                     stop=stop,
+                    partial=partial,
                     target=target,
                     qty=qty,
                     max_hold_bars=max_hold_bars,
                     total_cost_pct=total_cost_pct,
                     breakeven_r=breakeven_r,
+                    partial_size_pct=partial_size_pct,
                 )
 
                 r_multiple = pnl / risk_amount if risk_amount > 0 else np.nan
@@ -1067,6 +1069,7 @@ def run_backtest(
                         "entry": entry,
                         "exit": exit_price,
                         "stop": stop,
+                        "partial": partial,
                         "target": target,
                         "qty": qty,
                         "pnl": pnl,
@@ -1080,22 +1083,7 @@ def run_backtest(
                 trades_count += 1
                 i = exit_idx + 1
 
-            if trades_count == 0:
-                debug_rows.append(
-                    {
-                        "ticker": ticker.replace(".SA", ""),
-                        "status": "sem trades",
-                        "motivo": "os dados existem, mas nenhuma barra passou por todos os filtros de OPERAR AGORA",
-                    }
-                )
-            else:
-                debug_rows.append(
-                    {
-                        "ticker": ticker.replace(".SA", ""),
-                        "status": "ok",
-                        "motivo": f"{trades_count} trades no backtest",
-                    }
-                )
+            debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "ok" if trades_count > 0 else "sem trades", "motivo": f"{trades_count} trades no backtest" if trades_count > 0 else "nenhuma barra passou pelos filtros"})
 
         except Exception as e:
             debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": str(e)})
@@ -1120,26 +1108,24 @@ def run_backtest(
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
     net_profit = trades_df["pnl"].sum()
     win_rate = wins / total_trades if total_trades > 0 else np.nan
-    expectancy_r = trades_df["r_multiple"].mean() if "r_multiple" in trades_df.columns else np.nan
-    max_drawdown = trades_df["drawdown"].min() if not trades_df.empty else np.nan
+    expectancy_r = trades_df["r_multiple"].mean() if total_trades > 0 else np.nan
+    max_drawdown = trades_df["drawdown"].min() if total_trades > 0 else np.nan
     final_equity = capital + net_profit
 
-    summary_df = pd.DataFrame(
-        [
-            {
-                "trades": total_trades,
-                "wins": wins,
-                "losses": losses,
-                "win_rate": win_rate,
-                "net_profit": net_profit,
-                "final_equity": final_equity,
-                "profit_factor": profit_factor,
-                "payoff": payoff,
-                "expectancy_r": expectancy_r,
-                "max_drawdown": max_drawdown,
-            }
-        ]
-    )
+    summary_df = pd.DataFrame([
+        {
+            "trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "net_profit": net_profit,
+            "final_equity": final_equity,
+            "profit_factor": profit_factor,
+            "payoff": payoff,
+            "expectancy_r": expectancy_r,
+            "max_drawdown": max_drawdown,
+        }
+    ])
 
     by_ticker = (
         trades_df.groupby("ticker")
@@ -1160,16 +1146,9 @@ def run_backtest(
 # =========================================================
 # GRÁFICOS
 # =========================================================
-def build_price_chart(data: pd.DataFrame, title: str, entry: float, stop: float, target: float) -> go.Figure:
+def build_price_chart(data: pd.DataFrame, title: str, entry: float, stop: float, partial: float, target: float) -> go.Figure:
     plot_df = data.tail(120).copy()
-
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.75, 0.25],
-    )
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.75, 0.25])
 
     fig.add_trace(
         go.Candlestick(
@@ -1183,27 +1162,16 @@ def build_price_chart(data: pd.DataFrame, title: str, entry: float, stop: float,
         row=1,
         col=1,
     )
-
     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["EMA9"], name="EMA9"), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["EMA21"], name="EMA21"), row=1, col=1)
-
     if "VWAP" in plot_df.columns and plot_df["VWAP"].notna().any():
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["VWAP"], name="VWAP"), row=1, col=1)
-
-    fig.add_trace(
-        go.Bar(
-            x=plot_df.index,
-            y=plot_df["Volume"],
-            name="Volume",
-        ),
-        row=2,
-        col=1,
-    )
+    fig.add_trace(go.Bar(x=plot_df.index, y=plot_df["Volume"], name="Volume"), row=2, col=1)
 
     fig.add_hrect(y0=stop, y1=entry, fillcolor="rgba(255,0,0,0.12)", line_width=0, row=1, col=1)
     fig.add_hrect(y0=entry, y1=target, fillcolor="rgba(0,255,0,0.12)", line_width=0, row=1, col=1)
 
-    for level, name in [(entry, "Entrada"), (stop, "Stop"), (target, "Alvo")]:
+    for level, name in [(entry, "Entrada"), (stop, "Stop"), (partial, "Parcial"), (target, "Alvo")]:
         fig.add_hline(y=level, annotation_text=f"{name}: {level:.2f}", row=1, col=1)
 
     fig.update_layout(
@@ -1218,72 +1186,30 @@ def build_price_chart(data: pd.DataFrame, title: str, entry: float, stop: float,
     return fig
 
 
-def build_equity_chart(trades_df: pd.DataFrame, initial_capital: float) -> go.Figure:
-    if trades_df.empty:
-        fig = go.Figure()
-        fig.update_layout(title="Curva de capital", height=360)
-        return fig
-
-    plot_df = trades_df.copy()
-    plot_df["equity_start"] = initial_capital
-
+def build_equity_chart(trades_df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=plot_df["exit_time"],
-            y=plot_df["equity"],
-            mode="lines+markers",
-            name="Capital",
-        )
-    )
-    fig.update_layout(
-        title="Curva de capital do backtest",
-        xaxis_title="Saída do trade",
-        yaxis_title="Capital",
-        height=360,
-        margin=dict(l=20, r=20, t=50, b=20),
-    )
+    if not trades_df.empty:
+        fig.add_trace(go.Scatter(x=trades_df["exit_time"], y=trades_df["equity"], mode="lines+markers", name="Capital"))
+    fig.update_layout(title="Curva de capital do backtest", xaxis_title="Saída do trade", yaxis_title="Capital", height=360)
     return fig
 
 
 # =========================================================
 # INTERFACE
 # =========================================================
-st.title("📈 Robô Pessoal de Análise de Ações — V5")
-st.caption("Agora com backtest para medir se o filtro realmente ajuda a evitar operações ruins.")
+st.title("📈 Robô Pessoal de Análise de Ações — V6")
+st.caption("Agora com filtro de horário, RVOL contextual, candle de força e proteção parcial/breakeven.")
 
 with st.sidebar:
     st.header("Configurações")
-
-    tickers_text = st.text_area(
-        "Ativos monitorados (separados por vírgula)",
-        value=DEFAULT_TICKERS,
-        help="Ex.: PETR4, VALE3, BBAS3",
-    )
-
-    trigger_interval_label = st.selectbox(
-        "Intervalo de gatilho",
-        list(TRIGGER_INTERVAL_OPTIONS.keys()),
-        index=1,
-    )
-
-    trigger_period_label = st.selectbox(
-        "Período do gatilho",
-        list(TRIGGER_PERIOD_OPTIONS.keys()),
-        index=0,
-    )
-
-    trend_period_label = st.selectbox(
-        "Período diário para tendência maior",
-        list(TREND_PERIOD_OPTIONS.keys()),
-        index=0,
-    )
-
-    benchmark = st.text_input("Benchmark", value="^BVSP").strip().upper() or "^BVSP"
+    tickers_text = st.text_area("Ativos monitorados (separados por vírgula)", value=DEFAULT_TICKERS)
+    trigger_interval_label = st.selectbox("Intervalo de gatilho", list(TRIGGER_INTERVAL_OPTIONS.keys()), index=1)
+    trigger_period_label = st.selectbox("Período do gatilho", list(TRIGGER_PERIOD_OPTIONS.keys()), index=0)
+    trend_period_label = st.selectbox("Período diário para tendência maior", list(TREND_PERIOD_OPTIONS.keys()), index=0)
+    benchmark = st.text_input("Referência", value="^BVSP").strip().upper() or "^BVSP"
 
     st.divider()
     st.subheader("Gestão de risco")
-
     capital = st.number_input("Capital total (R$)", min_value=100.0, value=10000.0, step=100.0)
     risk_per_trade_pct = st.slider("Risco por operação (%)", 0.25, 3.0, 1.0, 0.25) / 100
     daily_loss_limit_pct = st.slider("Perda máxima no dia (%)", 1.0, 5.0, 2.0, 0.5) / 100
@@ -1291,7 +1217,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Filtros duros")
-
     min_rr = st.slider("Risco/retorno mínimo", 1.5, 4.0, 2.0, 0.1)
     min_upside_pct = st.slider("Potencial mínimo (%)", 0.5, 5.0, 1.2, 0.1) / 100
     min_liquidity_million = st.slider("Liquidez mínima média (R$ mi)", 1.0, 50.0, 10.0, 1.0)
@@ -1303,14 +1228,23 @@ with st.sidebar:
     entry_max_rsi = st.slider("RSI máximo para entrada", 55, 80, 68, 1)
     entry_min_score = st.slider("Score mínimo para entrada", 70, 100, 85, 1)
     require_breakout = st.checkbox("Exigir rompimento confirmado", value=True)
+    require_strong_candle = st.checkbox("Exigir candle de força", value=True)
+
+    st.divider()
+    st.subheader("Filtro de horário")
+    use_time_filter = st.checkbox("Usar janela de horário", value=True)
+    morning_window = st.select_slider("Janela da manhã", options=TIME_CHOICES, value=("10:05", "11:30"))
+    use_afternoon = st.checkbox("Usar janela da tarde", value=True)
+    afternoon_window = st.select_slider("Janela da tarde", options=TIME_CHOICES, value=("14:00", "16:30"))
 
     st.divider()
     st.subheader("Backtest")
     run_backtest_toggle = st.checkbox("Mostrar backtest", value=True)
-    backtest_period_label = st.selectbox("Janela do backtest", list(BACKTEST_PERIOD_OPTIONS.keys()), index=1)
-    max_hold_bars = st.slider("Máximo de candles por trade", 3, 60, 20)
-    total_cost_pct = st.slider("Custo total por trade (%)", 0.0, 1.0, 0.10, 0.01) / 100
+    backtest_period_label = st.selectbox("Janela faz backtest", list(BACKTEST_PERIOD_OPTIONS.keys()), index=1)
+    max_hold_bars = st.slider("Máximo de velas por comércio", 3, 60, 20)
+    total_cost_pct = st.slider("Custo total por transação (%)", 0.0, 1.0, 0.10, 0.01) / 100
     breakeven_r = st.slider("Mover stop para breakeven em (R)", 0.5, 2.0, 1.0, 0.1)
+    partial_size_pct = st.slider("Parcial no 1R (% da posição)", 25, 75, 50, 5) / 100
 
     st.divider()
     auto_refresh = st.checkbox("Atualização automática", value=False)
@@ -1326,6 +1260,7 @@ trigger_period = TRIGGER_PERIOD_OPTIONS[trigger_period_label]
 trigger_interval = TRIGGER_INTERVAL_OPTIONS[trigger_interval_label]
 trend_period = TREND_PERIOD_OPTIONS[trend_period_label]
 backtest_period = BACKTEST_PERIOD_OPTIONS[backtest_period_label]
+allowed_windows = build_allowed_windows(use_time_filter, morning_window, afternoon_window, use_afternoon)
 
 tickers = [normalize_ticker(t) for t in tickers_text.split(",")]
 tickers = [t for t in tickers if t]
@@ -1361,6 +1296,8 @@ summary, chart_map, regime_info, debug_df = build_summary(
     entry_max_rsi=entry_max_rsi,
     entry_min_score=entry_min_score,
     require_breakout=require_breakout,
+    require_strong_candle=require_strong_candle,
+    allowed_windows=allowed_windows,
 )
 
 if summary.empty:
@@ -1388,16 +1325,12 @@ st.caption(regime_info["reason"])
 
 best_row = summary.iloc[0]
 decision_icon = SIGNAL_COLORS.get(best_row["decision"], "•")
-
 st.markdown(f"### {decision_icon} Decisão final do melhor ativo: **{best_row['ticker']} — {best_row['decision']}**")
-st.caption(
-    f"Score {best_row['score']:.0f} | Entrada {best_row['entry']:.2f} | Stop {best_row['stop']:.2f} | Alvo {best_row['target']:.2f}"
-)
+st.caption(f"Score {best_row['score']:.0f} | Entrada {best_row['entry']:.2f} | Stop {best_row['stop']:.2f} | Alvo {best_row['target']:.2f}")
 
 st.subheader("Top oportunidades")
 top_df = summary.head(top_n).copy()
 cols = st.columns(len(top_df))
-
 for col, (_, row) in zip(cols, top_df.iterrows()):
     signal_icon = SIGNAL_COLORS.get(row["decision"], "•")
     with col:
@@ -1407,6 +1340,7 @@ for col, (_, row) in zip(cols, top_df.iterrows()):
         st.write(f"**Preço atual:** {format_money(row['close'])}")
         st.write(f"**Entrada:** {format_money(row['entry'])}")
         st.write(f"**Stop:** {format_money(row['stop'])}")
+        st.write(f"**Parcial:** {format_money(row['partial'])}")
         st.write(f"**Alvo:** {format_money(row['target'])}")
         st.write(f"**Potencial ganho:** {format_pct(row['upside_pct'])}")
         st.write(f"**Risco perda:** {format_pct(row['stop_pct'])}")
@@ -1418,80 +1352,35 @@ for col, (_, row) in zip(cols, top_df.iterrows()):
         st.write(f"**Bloqueios:** {row['hard_blocks']}")
 
 with st.expander("📋 Ver ranking completo"):
-    display_df = summary[
-        [
-            "ticker",
-            "decision",
-            "score",
-            "close",
-            "entry",
-            "stop",
-            "target",
-            "risk_reward",
-            "stop_pct",
-            "upside_pct",
-            "qty",
-            "position_value",
-            "position_pct",
-            "rsi",
-            "rvol",
-            "volatility",
-            "relative_strength",
-            "liquidity_value",
-            "strengths",
-            "alerts",
-            "hard_blocks",
-        ]
-    ].copy()
-
+    display_df = summary[[
+        "ticker", "decision", "score", "close", "entry", "stop", "partial", "target",
+        "risk_reward", "stop_pct", "upside_pct", "qty", "position_value", "position_pct",
+        "rsi", "rvol", "volatility", "relative_strength", "liquidity_value", "strengths", "alerts", "hard_blocks"
+    ]].copy()
     display_df.columns = [
-        "Ticker",
-        "Decisão",
-        "Score",
-        "Preço",
-        "Entrada",
-        "Stop",
-        "Alvo",
-        "Risco/Retorno",
-        "Risco %",
-        "Potencial %",
-        "Qtd",
-        "Valor Posição",
-        "Exposição %",
-        "RSI",
-        "RVOL",
-        "Volatilidade",
-        "Força Relativa",
-        "Liquidez Média",
-        "Fortes",
-        "Alertas",
-        "Bloqueios",
+        "Ticker", "Decisão", "Score", "Preço", "Entrada", "Stop", "Parcial", "Alvo",
+        "Risco/Retorno", "Risco %", "Potencial %", "Qtd", "Valor Posição", "Exposição %",
+        "RSI", "RVOL efetivo", "Volatilidade", "Força Relativa", "Liquidez Média", "Fortes", "Alertas", "Bloqueios"
     ]
-
+    display_df["Preço"] = display_df["Preço"].map(format_money)
+    display_df["Entrada"] = display_df["Entrada"].map(format_money)
+    display_df["Stop"] = display_df["Stop"].map(format_money)
+    display_df["Parcial"] = display_df["Parcial"].map(format_money)
+    display_df["Alvo"] = display_df["Alvo"].map(format_money)
+    display_df["Valor Posição"] = display_df["Valor Posição"].map(format_money)
+    display_df["Liquidez Média"] = display_df["Liquidez Média"].map(format_money)
     display_df["Risco/Retorno"] = display_df["Risco/Retorno"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
     display_df["Risco %"] = display_df["Risco %"].map(format_pct)
     display_df["Potencial %"] = display_df["Potencial %"].map(format_pct)
     display_df["Exposição %"] = display_df["Exposição %"].map(format_pct)
     display_df["Volatilidade"] = display_df["Volatilidade"].map(format_pct)
     display_df["Força Relativa"] = display_df["Força Relativa"].map(format_pct)
-    display_df["Preço"] = display_df["Preço"].map(format_money)
-    display_df["Entrada"] = display_df["Entrada"].map(format_money)
-    display_df["Stop"] = display_df["Stop"].map(format_money)
-    display_df["Alvo"] = display_df["Alvo"].map(format_money)
-    display_df["Valor Posição"] = display_df["Valor Posição"].map(format_money)
-    display_df["Liquidez Média"] = display_df["Liquidez Média"].map(format_money)
     display_df["RSI"] = display_df["RSI"].map(lambda x: f"{x:.1f}")
-    display_df["RVOL"] = display_df["RVOL"].map(lambda x: f"{x:.2f}")
+    display_df["RVOL efetivo"] = display_df["RVOL efetivo"].map(lambda x: f"{x:.2f}")
     display_df["Qtd"] = display_df["Qtd"].map(lambda x: int(x))
-
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-selected_label = st.selectbox(
-    "Ativo para ver o gráfico detalhado",
-    options=summary["ticker"].tolist(),
-    index=0,
-)
-
+selected_label = st.selectbox("Ativo para ver o gráfico detalhado", options=summary["ticker"].tolist(), index=0)
 selected_ticker = normalize_ticker(selected_label)
 selected_row = summary.loc[summary["ticker"] == selected_label].iloc[0]
 selected_data = chart_map[selected_ticker]
@@ -1502,6 +1391,7 @@ price_fig = build_price_chart(
     title=f"{selected_label} | {selected_row['decision']}",
     entry=float(selected_row["entry"]),
     stop=float(selected_row["stop"]),
+    partial=float(selected_row["partial"]),
     target=float(selected_row["target"]),
 )
 st.plotly_chart(price_fig, use_container_width=True)
@@ -1509,7 +1399,6 @@ st.plotly_chart(price_fig, use_container_width=True)
 latest_close = float(selected_row["close"])
 alert_above = safe_float(alert_above_text)
 alert_below = safe_float(alert_below_text)
-
 manual_alerts = []
 if alert_above is not None and latest_close >= alert_above:
     manual_alerts.append(f"Preço atingiu ou superou o alerta de alta: {alert_above:.2f}")
@@ -1561,11 +1450,14 @@ if run_backtest_toggle:
         entry_max_rsi=entry_max_rsi,
         entry_min_score=entry_min_score,
         require_breakout=require_breakout,
+        require_strong_candle=require_strong_candle,
+        allowed_windows=allowed_windows,
         breakeven_r=breakeven_r,
+        partial_size_pct=partial_size_pct,
     )
 
     if bt_trades.empty:
-        st.warning("O backtest não encontrou trades com as regras atuais. Isso pode ser bom se o filtro ficou muito rígido, ou pode exigir ajuste fino.")
+        st.warning("O backtest não encontrou trades com as regras atuais.")
         if not bt_debug.empty:
             st.dataframe(bt_debug, use_container_width=True, hide_index=True)
     else:
@@ -1584,8 +1476,7 @@ if run_backtest_toggle:
         b9.metric("Vencedores", int(s["wins"]))
         b10.metric("Perdedores", int(s["losses"]))
 
-        equity_fig = build_equity_chart(bt_trades, capital)
-        st.plotly_chart(equity_fig, use_container_width=True)
+        st.plotly_chart(build_equity_chart(bt_trades), use_container_width=True)
 
         with st.expander("📊 Resultado por ativo"):
             view_bt = bt_by_ticker.copy()
@@ -1598,11 +1489,8 @@ if run_backtest_toggle:
 
         with st.expander("🧾 Log de trades do backtest"):
             view_trades = bt_trades.copy()
-            view_trades["entry"] = view_trades["entry"].map(format_money)
-            view_trades["exit"] = view_trades["exit"].map(format_money)
-            view_trades["stop"] = view_trades["stop"].map(format_money)
-            view_trades["target"] = view_trades["target"].map(format_money)
-            view_trades["pnl"] = view_trades["pnl"].map(format_money)
+            for col in ["entry", "exit", "stop", "partial", "target", "pnl"]:
+                view_trades[col] = view_trades[col].map(format_money)
             view_trades["ret_capital"] = view_trades["ret_capital"].map(format_pct)
             view_trades["r_multiple"] = view_trades["r_multiple"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
             view_trades["score"] = view_trades["score"].map(lambda x: f"{x:.0f}")
@@ -1611,35 +1499,35 @@ if run_backtest_toggle:
 with st.expander("Como o robô decide"):
     st.markdown(
         """
-        - **OPERAR AGORA**: só aparece quando o contexto está alinhado e não há bloqueios duros.
-        - **OBSERVAR**: ativo interessante, mas sem confirmação suficiente.
-        - **NÃO OPERAR**: o robô recusou o trade por contexto ruim ou filtro duro.
+        - **OPERAR AGORA**: contexto alinhado, horário válido, candle forte e sem bloqueios.
+        - **OBSERVAR**: ativo interessante, mas faltou confirmação.
+        - **NÃO OPERAR**: o robô recusou o trade por filtro duro.
+
+        **Melhorias da V6:**
+        - filtro de horário
+        - RVOL contextual por horário
+        - rompimento confirmado
+        - candle de força
+        - parcial no 1R
+        - breakeven automático
 
         **Bloqueios duros atuais:**
+        - fora da janela de horário
         - mercado defensivo
         - tendência diária fraca
         - estrutura 60m fraca
         - gatilho abaixo da EMA21
         - preço abaixo da VWAP
-        - RVOL abaixo do mínimo configurado
-        - RSI acima do limite de entrada
-        - falta de rompimento confirmado quando exigido
+        - RVOL abaixo do mínimo
+        - RSI acima do máximo
+        - sem rompimento quando exigido
+        - candle sem força quando exigido
         - risco/retorno abaixo do mínimo
         - potencial abaixo do mínimo
         - liquidez abaixo do mínimo
-        - quantidade inviável
-        - posição acima do capital
-        - posição acima da exposição máxima
         - score abaixo do mínimo de entrada
-
-        **Backtest desta V5:**
-        - entra apenas quando a decisão é **OPERAR AGORA**
-        - sai no **alvo**, **stop** ou **tempo máximo em candles**
-        - desconta **custo total por trade**
-        - mostra lucro líquido, drawdown, payoff e expectância em R
         """
     )
 
 st.caption("Uso educacional. Não é garantia de lucro e não substitui gerenciamento de risco, backtest amplo, taxas reais e disciplina operacional.")
-
-st.info("Dica: se o navegador estiver traduzindo a página automaticamente, alguns textos como 'OPERAR AGORA' podem aparecer estranhos. Desative a tradução automática nesta página para ver os rótulos corretamente.")
+st.info("Dica: se o navegador estiver traduzindo a página automaticamente, alguns rótulos podem ficar estranhos. Desative a tradução nesta página para ver os textos corretamente.")
