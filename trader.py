@@ -11,7 +11,7 @@ import yfinance as yf
 
 
 st.set_page_config(
-    page_title="Robô Pessoal de Análise de Ações — V4",
+    page_title="Robô Pessoal de Análise de Ações — V5",
     page_icon="📈",
     layout="wide",
 )
@@ -36,6 +36,13 @@ TREND_PERIOD_OPTIONS = {
     "6 meses": "6mo",
     "1 ano": "1y",
     "2 anos": "2y",
+}
+
+BACKTEST_PERIOD_OPTIONS = {
+    "1 mês": "1mo",
+    "3 meses": "3mo",
+    "6 meses": "6mo",
+    "1 ano": "1y",
 }
 
 SIGNAL_COLORS = {
@@ -85,6 +92,10 @@ def format_money(value: float) -> str:
     if pd.isna(value):
         return "-"
     return f"R$ {value:,.2f}"
+
+
+def interval_label_to_code(label: str) -> str:
+    return TRIGGER_INTERVAL_OPTIONS.get(label, label)
 
 
 # =========================================================
@@ -253,29 +264,48 @@ def add_indicators(
 # =========================================================
 # REGIME DE MERCADO
 # =========================================================
-def detect_market_regime(benchmark_df: pd.DataFrame) -> Dict[str, float]:
-    if benchmark_df.empty or len(benchmark_df) < 60:
-        return {
-            "regime": "LATERAL",
-            "reason": "Índice com poucos dados para confirmar tendência.",
-            "close": np.nan,
-            "ema21": np.nan,
-            "ema50": np.nan,
-            "rsi": np.nan,
-            "ret20": np.nan,
-        }
+def build_regime_table(benchmark_df: pd.DataFrame) -> pd.DataFrame:
+    if benchmark_df.empty:
+        return pd.DataFrame()
 
     bench = benchmark_df.copy()
     bench["EMA21"] = bench["Close"].ewm(span=21, adjust=False).mean()
     bench["EMA50"] = bench["Close"].ewm(span=50, adjust=False).mean()
     bench["RSI14"] = calculate_rsi(bench["Close"], 14)
     bench["RET20"] = bench["Close"].pct_change(20)
-    bench = bench.dropna().copy()
 
-    if bench.empty:
+    regime = []
+    reason = []
+    for _, row in bench.iterrows():
+        close = row["Close"]
+        ema21 = row["EMA21"]
+        ema50 = row["EMA50"]
+        rsi = row["RSI14"]
+        ret20 = row["RET20"]
+
+        if pd.isna(ema21) or pd.isna(ema50) or pd.isna(rsi) or pd.isna(ret20):
+            regime.append("LATERAL")
+            reason.append("Índice com poucos dados para confirmar tendência.")
+        elif close > ema21 > ema50 and rsi >= 52 and ret20 > 0:
+            regime.append("COMPRADOR")
+            reason.append("Índice acima da EMA21/EMA50, RSI positivo e retorno recente positivo.")
+        elif close < ema21 < ema50 and rsi < 48 and ret20 < 0:
+            regime.append("DEFENSIVO")
+            reason.append("Índice abaixo da EMA21/EMA50, RSI fraco e retorno recente negativo.")
+        else:
+            regime.append("LATERAL")
+            reason.append("Mercado sem alinhamento claro de tendência.")
+
+    bench["REGIME"] = regime
+    bench["REASON"] = reason
+    return bench
+
+
+def get_regime_info_at(regime_table: pd.DataFrame, timestamp) -> Dict[str, float]:
+    if regime_table.empty:
         return {
             "regime": "LATERAL",
-            "reason": "Índice sem dados válidos após cálculo do regime.",
+            "reason": "Índice indisponível.",
             "close": np.nan,
             "ema21": np.nan,
             "ema50": np.nan,
@@ -283,31 +313,20 @@ def detect_market_regime(benchmark_df: pd.DataFrame) -> Dict[str, float]:
             "ret20": np.nan,
         }
 
-    last = bench.iloc[-1]
-    close = float(last["Close"])
-    ema21 = float(last["EMA21"])
-    ema50 = float(last["EMA50"])
-    rsi = float(last["RSI14"])
-    ret20 = float(last["RET20"])
-
-    if close > ema21 > ema50 and rsi >= 52 and ret20 > 0:
-        regime = "COMPRADOR"
-        reason = "Índice acima da EMA21/EMA50, RSI positivo e retorno recente positivo."
-    elif close < ema21 < ema50 and rsi < 48 and ret20 < 0:
-        regime = "DEFENSIVO"
-        reason = "Índice abaixo da EMA21/EMA50, RSI fraco e retorno recente negativo."
+    subset = regime_table.loc[regime_table.index <= timestamp]
+    if subset.empty:
+        row = regime_table.iloc[0]
     else:
-        regime = "LATERAL"
-        reason = "Mercado sem alinhamento claro de tendência."
+        row = subset.iloc[-1]
 
     return {
-        "regime": regime,
-        "reason": reason,
-        "close": close,
-        "ema21": ema21,
-        "ema50": ema50,
-        "rsi": rsi,
-        "ret20": ret20,
+        "regime": row.get("REGIME", "LATERAL"),
+        "reason": row.get("REASON", "Mercado sem alinhamento claro de tendência."),
+        "close": float(row["Close"]) if pd.notna(row.get("Close")) else np.nan,
+        "ema21": float(row["EMA21"]) if pd.notna(row.get("EMA21")) else np.nan,
+        "ema50": float(row["EMA50"]) if pd.notna(row.get("EMA50")) else np.nan,
+        "rsi": float(row["RSI14"]) if pd.notna(row.get("RSI14")) else np.nan,
+        "ret20": float(row["RET20"]) if pd.notna(row.get("RET20")) else np.nan,
     }
 
 
@@ -397,12 +416,11 @@ def get_structure_settings(trigger_interval: str) -> Tuple[str, str]:
     return "1mo", "60m"
 
 
-def evaluate_asset(
+def evaluate_asset_from_indicator_frames(
     ticker: str,
-    daily_data: pd.DataFrame,
-    structure_data: pd.DataFrame,
-    trigger_data: pd.DataFrame,
-    benchmark_daily_close: pd.Series,
+    daily: pd.DataFrame,
+    structure: pd.DataFrame,
+    trigger: pd.DataFrame,
     regime_info: Dict[str, float],
     capital: float,
     risk_per_trade_pct: float,
@@ -411,12 +429,6 @@ def evaluate_asset(
     min_upside_pct: float,
     min_liquidity_million: float,
 ) -> Dict[str, float]:
-    daily = add_indicators(daily_data, "1d", benchmark_daily_close)
-    structure_interval = "1d" if len(structure_data) == len(daily_data) else "60m"
-    structure = add_indicators(structure_data, structure_interval, None)
-    trigger_interval = "1d" if trigger_data.index.equals(daily_data.index) else "intraday"
-    trigger = add_indicators(trigger_data, "1d" if trigger_interval == "1d" else "15m", None)
-
     if daily.empty:
         raise ValueError("diário sem indicadores")
     if structure.empty:
@@ -464,9 +476,6 @@ def evaluate_asset(
     stop_pct = (levels["entry"] - levels["stop"]) / levels["entry"] if levels["entry"] > 0 else np.nan
     upside_pct = (levels["target"] - levels["entry"]) / levels["entry"] if levels["entry"] > 0 else np.nan
 
-    # ---------------------------
-    # SCORE
-    # ---------------------------
     if regime_info["regime"] == "COMPRADOR":
         score += 12
         strengths.append("Mercado favorável")
@@ -477,7 +486,6 @@ def evaluate_asset(
         score -= 20
         alerts.append("Mercado defensivo")
 
-    # Tendência diária
     if close_daily > daily_ema21 > daily_ema50:
         score += 24
         strengths.append("Tendência diária alinhada")
@@ -487,7 +495,6 @@ def evaluate_asset(
         score -= 20
         alerts.append("Diário abaixo da EMA21")
 
-    # Estrutura 60m
     if close_structure > structure_ema21 and structure_ema9 > structure_ema21:
         score += 18
         strengths.append("Estrutura intraday positiva")
@@ -497,7 +504,6 @@ def evaluate_asset(
         score -= 12
         alerts.append("Estrutura fraca")
 
-    # Gatilho
     if close_trigger > trigger_ema21:
         score += 10
         strengths.append("Gatilho acima da EMA21")
@@ -576,7 +582,6 @@ def evaluate_asset(
         score -= 8
         alerts.append("Stop muito longo")
 
-    # Liquidez
     liquidity_cut = min_liquidity_million * 1_000_000
     if liquidity_value >= liquidity_cut:
         score += 8
@@ -585,42 +590,28 @@ def evaluate_asset(
         score -= 18
         alerts.append("Liquidez fraca")
 
-    # ---------------------------
-    # BLOQUEIOS DUROS
-    # ---------------------------
     if regime_info["regime"] == "DEFENSIVO":
         hard_blocks.append("Mercado defensivo")
-
     if close_daily <= daily_ema21:
         hard_blocks.append("Tendência diária não alinhada")
-
     if close_structure <= structure_ema21:
         hard_blocks.append("Estrutura 60m fraca")
-
     if close_trigger <= trigger_ema21:
         hard_blocks.append("Gatilho abaixo da EMA21")
-
     if pd.notna(trigger_vwap) and close_trigger <= trigger_vwap:
         hard_blocks.append("Preço abaixo da VWAP")
-
     if trigger_rvol < 0.80:
         hard_blocks.append("RVOL abaixo de 0.80")
-
     if levels["rr"] < min_rr:
         hard_blocks.append("Risco/retorno abaixo do mínimo")
-
     if pd.notna(upside_pct) and upside_pct < min_upside_pct:
         hard_blocks.append("Potencial abaixo do mínimo")
-
     if liquidity_value < liquidity_cut:
         hard_blocks.append("Liquidez abaixo do mínimo")
-
     if position["qty"] <= 0:
         hard_blocks.append("Quantidade inviável")
-
     if position["position_value"] > capital:
         hard_blocks.append("Excede o capital disponível")
-
     if position["position_pct"] > max_position_pct:
         hard_blocks.append("Excede exposição máxima")
 
@@ -687,7 +678,8 @@ def build_summary(
     debug_rows = []
 
     benchmark_daily = load_data(benchmark, trend_period, "1d")
-    regime_info = detect_market_regime(benchmark_daily)
+    regime_table = build_regime_table(benchmark_daily)
+    regime_info = get_regime_info_at(regime_table, benchmark_daily.index.max() if not benchmark_daily.empty else pd.Timestamp.now())
     benchmark_daily_close = benchmark_daily["Close"] if not benchmark_daily.empty else pd.Series(dtype=float)
 
     structure_period, structure_interval = get_structure_settings(trigger_interval)
@@ -699,29 +691,24 @@ def build_summary(
             trigger_raw = load_data(ticker, trigger_period, trigger_interval)
 
             if daily_raw.empty:
-                debug_rows.append(
-                    {"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no diário"}
-                )
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no diário"})
                 continue
-
             if structure_raw.empty:
-                debug_rows.append(
-                    {"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no timeframe de estrutura"}
-                )
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no timeframe de estrutura"})
                 continue
-
             if trigger_raw.empty:
-                debug_rows.append(
-                    {"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no timeframe de gatilho"}
-                )
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "sem dados no timeframe de gatilho"})
                 continue
 
-            evaluated = evaluate_asset(
+            daily_ind = add_indicators(daily_raw, "1d", benchmark_daily_close)
+            structure_ind = add_indicators(structure_raw, structure_interval, None)
+            trigger_ind = add_indicators(trigger_raw, trigger_interval, None)
+
+            evaluated = evaluate_asset_from_indicator_frames(
                 ticker=ticker,
-                daily_data=daily_raw,
-                structure_data=structure_raw,
-                trigger_data=trigger_raw,
-                benchmark_daily_close=benchmark_daily_close,
+                daily=daily_ind,
+                structure=structure_ind,
+                trigger=trigger_ind,
                 regime_info=regime_info,
                 capital=capital,
                 risk_per_trade_pct=risk_per_trade_pct,
@@ -732,7 +719,7 @@ def build_summary(
             )
 
             rows.append(evaluated)
-            chart_map[ticker] = add_indicators(trigger_raw, "1d" if trigger_interval == "1d" else "15m", None)
+            chart_map[ticker] = trigger_ind
 
             debug_rows.append(
                 {
@@ -743,9 +730,7 @@ def build_summary(
             )
 
         except Exception as e:
-            debug_rows.append(
-                {"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": str(e)}
-            )
+            debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": str(e)})
 
     debug_df = pd.DataFrame(debug_rows)
 
@@ -754,11 +739,7 @@ def build_summary(
 
     summary = pd.DataFrame(rows)
 
-    decision_order = {
-        "OPERAR AGORA": 0,
-        "OBSERVAR": 1,
-        "NÃO OPERAR": 2,
-    }
+    decision_order = {"OPERAR AGORA": 0, "OBSERVAR": 1, "NÃO OPERAR": 2}
     summary["decision_order"] = summary["decision"].map(decision_order).fillna(9)
 
     summary["ranking"] = (
@@ -778,9 +759,245 @@ def build_summary(
 
 
 # =========================================================
-# GRÁFICO
+# BACKTEST
 # =========================================================
-def build_chart(data: pd.DataFrame, title: str, entry: float, stop: float, target: float) -> go.Figure:
+def simulate_trade_path(
+    trigger_ind: pd.DataFrame,
+    start_idx: int,
+    entry: float,
+    stop: float,
+    target: float,
+    qty: int,
+    max_hold_bars: int,
+    total_cost_pct: float,
+) -> Tuple[int, float, str, float]:
+    end_idx = min(start_idx + max_hold_bars, len(trigger_ind) - 1)
+    if end_idx <= start_idx:
+        exit_price = float(trigger_ind.iloc[start_idx]["Close"])
+        turnover = qty * (entry + exit_price)
+        costs = turnover * total_cost_pct
+        pnl = (exit_price - entry) * qty - costs
+        return start_idx, exit_price, "sem barras futuras", pnl
+
+    exit_idx = end_idx
+    exit_price = float(trigger_ind.iloc[end_idx]["Close"])
+    reason = "tempo esgotado"
+
+    for j in range(start_idx + 1, end_idx + 1):
+        row = trigger_ind.iloc[j]
+        high = float(row["High"])
+        low = float(row["Low"])
+        close = float(row["Close"])
+
+        if low <= stop and high >= target:
+            exit_idx = j
+            exit_price = stop
+            reason = "ambíguo, assumido stop"
+            break
+        if low <= stop:
+            exit_idx = j
+            exit_price = stop
+            reason = "stop"
+            break
+        if high >= target:
+            exit_idx = j
+            exit_price = target
+            reason = "alvo"
+            break
+
+        exit_idx = j
+        exit_price = close
+
+    turnover = qty * (entry + exit_price)
+    costs = turnover * total_cost_pct
+    pnl = (exit_price - entry) * qty - costs
+    return exit_idx, exit_price, reason, pnl
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def run_backtest(
+    tickers: List[str],
+    backtest_period: str,
+    trigger_interval: str,
+    benchmark: str,
+    capital: float,
+    risk_per_trade_pct: float,
+    max_position_pct: float,
+    min_rr: float,
+    min_upside_pct: float,
+    min_liquidity_million: float,
+    max_hold_bars: int,
+    total_cost_pct: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    trades: List[Dict] = []
+    debug_rows: List[Dict] = []
+
+    benchmark_daily = load_data(benchmark, backtest_period, "1d")
+    benchmark_daily_close = benchmark_daily["Close"] if not benchmark_daily.empty else pd.Series(dtype=float)
+    regime_table = build_regime_table(benchmark_daily)
+
+    structure_period, structure_interval = get_structure_settings(trigger_interval)
+    if structure_interval != "1d":
+        structure_period = backtest_period
+
+    for ticker in tickers:
+        try:
+            daily_raw = load_data(ticker, backtest_period, "1d")
+            structure_raw = load_data(ticker, structure_period, structure_interval)
+            trigger_raw = load_data(ticker, backtest_period, trigger_interval)
+
+            if daily_raw.empty or structure_raw.empty or trigger_raw.empty:
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "dados insuficientes para backtest"})
+                continue
+
+            daily_ind = add_indicators(daily_raw, "1d", benchmark_daily_close)
+            structure_ind = add_indicators(structure_raw, structure_interval, None)
+            trigger_ind = add_indicators(trigger_raw, trigger_interval, None)
+
+            if daily_ind.empty or structure_ind.empty or trigger_ind.empty:
+                debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": "indicadores insuficientes para backtest"})
+                continue
+
+            i = 0
+            trades_count = 0
+            while i < len(trigger_ind) - 1:
+                ts = trigger_ind.index[i]
+                daily_slice = daily_ind.loc[daily_ind.index <= ts]
+                structure_slice = structure_ind.loc[structure_ind.index <= ts]
+                trigger_slice = trigger_ind.iloc[: i + 1]
+                regime_info = get_regime_info_at(regime_table, ts)
+
+                if daily_slice.empty or structure_slice.empty or len(trigger_slice) < 20:
+                    i += 1
+                    continue
+
+                evaluated = evaluate_asset_from_indicator_frames(
+                    ticker=ticker,
+                    daily=daily_slice,
+                    structure=structure_slice,
+                    trigger=trigger_slice,
+                    regime_info=regime_info,
+                    capital=capital,
+                    risk_per_trade_pct=risk_per_trade_pct,
+                    min_rr=min_rr,
+                    max_position_pct=max_position_pct,
+                    min_upside_pct=min_upside_pct,
+                    min_liquidity_million=min_liquidity_million,
+                )
+
+                if evaluated["decision"] != "OPERAR AGORA":
+                    i += 1
+                    continue
+
+                qty = int(evaluated["qty"])
+                if qty <= 0:
+                    i += 1
+                    continue
+
+                entry = float(evaluated["entry"])
+                stop = float(evaluated["stop"])
+                target = float(evaluated["target"])
+                risk_amount = float(evaluated["risk_amount"])
+
+                exit_idx, exit_price, exit_reason, pnl = simulate_trade_path(
+                    trigger_ind=trigger_ind,
+                    start_idx=i,
+                    entry=entry,
+                    stop=stop,
+                    target=target,
+                    qty=qty,
+                    max_hold_bars=max_hold_bars,
+                    total_cost_pct=total_cost_pct,
+                )
+
+                r_multiple = pnl / risk_amount if risk_amount > 0 else np.nan
+                trades.append(
+                    {
+                        "ticker": ticker.replace(".SA", ""),
+                        "entry_time": ts,
+                        "exit_time": trigger_ind.index[exit_idx],
+                        "entry": entry,
+                        "exit": exit_price,
+                        "stop": stop,
+                        "target": target,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "ret_capital": pnl / capital if capital > 0 else np.nan,
+                        "r_multiple": r_multiple,
+                        "reason": exit_reason,
+                        "score": evaluated["score"],
+                        "regime": regime_info["regime"],
+                    }
+                )
+                trades_count += 1
+                i = exit_idx + 1
+
+            debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "ok", "motivo": f"{trades_count} trades no backtest"})
+
+        except Exception as e:
+            debug_rows.append({"ticker": ticker.replace(".SA", ""), "status": "erro", "motivo": str(e)})
+
+    debug_df = pd.DataFrame(debug_rows)
+    if not trades:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), debug_df
+
+    trades_df = pd.DataFrame(trades).sort_values("exit_time").reset_index(drop=True)
+    trades_df["equity"] = capital + trades_df["pnl"].cumsum()
+    trades_df["equity_peak"] = trades_df["equity"].cummax()
+    trades_df["drawdown"] = (trades_df["equity"] - trades_df["equity_peak"]) / trades_df["equity_peak"].replace(0, np.nan)
+
+    total_trades = len(trades_df)
+    wins = int((trades_df["pnl"] > 0).sum())
+    losses = int((trades_df["pnl"] <= 0).sum())
+    gross_profit = trades_df.loc[trades_df["pnl"] > 0, "pnl"].sum()
+    gross_loss = abs(trades_df.loc[trades_df["pnl"] <= 0, "pnl"].sum())
+    avg_win = trades_df.loc[trades_df["pnl"] > 0, "pnl"].mean() if wins > 0 else 0.0
+    avg_loss = abs(trades_df.loc[trades_df["pnl"] <= 0, "pnl"].mean()) if losses > 0 else 0.0
+    payoff = (avg_win / avg_loss) if avg_loss > 0 else np.nan
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
+    net_profit = trades_df["pnl"].sum()
+    win_rate = wins / total_trades if total_trades > 0 else np.nan
+    expectancy_r = trades_df["r_multiple"].mean() if "r_multiple" in trades_df.columns else np.nan
+    max_drawdown = trades_df["drawdown"].min() if not trades_df.empty else np.nan
+    final_equity = capital + net_profit
+
+    summary_df = pd.DataFrame(
+        [
+            {
+                "trades": total_trades,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "net_profit": net_profit,
+                "final_equity": final_equity,
+                "profit_factor": profit_factor,
+                "payoff": payoff,
+                "expectancy_r": expectancy_r,
+                "max_drawdown": max_drawdown,
+            }
+        ]
+    )
+
+    by_ticker = (
+        trades_df.groupby("ticker")
+        .agg(
+            trades=("ticker", "size"),
+            net_profit=("pnl", "sum"),
+            win_rate=("pnl", lambda s: (s > 0).mean()),
+            avg_r=("r_multiple", "mean"),
+            avg_score=("score", "mean"),
+        )
+        .reset_index()
+        .sort_values(["net_profit", "win_rate"], ascending=False)
+    )
+
+    return summary_df, trades_df, by_ticker, debug_df
+
+
+# =========================================================
+# GRÁFICOS
+# =========================================================
+def build_price_chart(data: pd.DataFrame, title: str, entry: float, stop: float, target: float) -> go.Figure:
     plot_df = data.tail(120).copy()
 
     fig = make_subplots(
@@ -820,23 +1037,8 @@ def build_chart(data: pd.DataFrame, title: str, entry: float, stop: float, targe
         col=1,
     )
 
-    fig.add_hrect(
-        y0=stop,
-        y1=entry,
-        fillcolor="rgba(255,0,0,0.12)",
-        line_width=0,
-        row=1,
-        col=1,
-    )
-
-    fig.add_hrect(
-        y0=entry,
-        y1=target,
-        fillcolor="rgba(0,255,0,0.12)",
-        line_width=0,
-        row=1,
-        col=1,
-    )
+    fig.add_hrect(y0=stop, y1=entry, fillcolor="rgba(255,0,0,0.12)", line_width=0, row=1, col=1)
+    fig.add_hrect(y0=entry, y1=target, fillcolor="rgba(0,255,0,0.12)", line_width=0, row=1, col=1)
 
     for level, name in [(entry, "Entrada"), (stop, "Stop"), (target, "Alvo")]:
         fig.add_hline(y=level, annotation_text=f"{name}: {level:.2f}", row=1, col=1)
@@ -850,15 +1052,42 @@ def build_chart(data: pd.DataFrame, title: str, entry: float, stop: float, targe
     )
     fig.update_yaxes(title_text="Preço", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
+    return fig
 
+
+def build_equity_chart(trades_df: pd.DataFrame, initial_capital: float) -> go.Figure:
+    if trades_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title="Curva de capital", height=360)
+        return fig
+
+    plot_df = trades_df.copy()
+    plot_df["equity_start"] = initial_capital
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["exit_time"],
+            y=plot_df["equity"],
+            mode="lines+markers",
+            name="Capital",
+        )
+    )
+    fig.update_layout(
+        title="Curva de capital do backtest",
+        xaxis_title="Saída do trade",
+        yaxis_title="Capital",
+        height=360,
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
     return fig
 
 
 # =========================================================
 # INTERFACE
 # =========================================================
-st.title("📈 Robô Pessoal de Análise de Ações — V4")
-st.caption("Foco em recusar operações ruins, controlar risco e priorizar contexto forte.")
+st.title("📈 Robô Pessoal de Análise de Ações — V5")
+st.caption("Agora com backtest para medir se o filtro realmente ajuda a evitar operações ruins.")
 
 with st.sidebar:
     st.header("Configurações")
@@ -906,6 +1135,13 @@ with st.sidebar:
     top_n = st.slider("Quantidade de sugestões", 1, 10, 3)
 
     st.divider()
+    st.subheader("Backtest")
+    run_backtest_toggle = st.checkbox("Mostrar backtest", value=True)
+    backtest_period_label = st.selectbox("Janela do backtest", list(BACKTEST_PERIOD_OPTIONS.keys()), index=1)
+    max_hold_bars = st.slider("Máximo de candles por trade", 3, 60, 12)
+    total_cost_pct = st.slider("Custo total por trade (%)", 0.0, 1.0, 0.10, 0.01) / 100
+
+    st.divider()
     auto_refresh = st.checkbox("Atualização automática", value=False)
     refresh_seconds = st.slider("Atualizar a cada (segundos)", 30, 600, 120, 30)
     force_update = st.button("Atualizar agora", use_container_width=True)
@@ -918,6 +1154,7 @@ with st.sidebar:
 trigger_period = TRIGGER_PERIOD_OPTIONS[trigger_period_label]
 trigger_interval = TRIGGER_INTERVAL_OPTIONS[trigger_interval_label]
 trend_period = TREND_PERIOD_OPTIONS[trend_period_label]
+backtest_period = BACKTEST_PERIOD_OPTIONS[backtest_period_label]
 
 tickers = [normalize_ticker(t) for t in tickers_text.split(",")]
 tickers = [t for t in tickers if t]
@@ -977,9 +1214,7 @@ st.caption(regime_info["reason"])
 best_row = summary.iloc[0]
 decision_icon = SIGNAL_COLORS.get(best_row["decision"], "•")
 
-st.markdown(
-    f"### {decision_icon} Decisão final do melhor ativo: **{best_row['ticker']} — {best_row['decision']}**"
-)
+st.markdown(f"### {decision_icon} Decisão final do melhor ativo: **{best_row['ticker']} — {best_row['decision']}**")
 st.caption(
     f"Score {best_row['score']:.0f} | Entrada {best_row['entry']:.2f} | Stop {best_row['stop']:.2f} | Alvo {best_row['target']:.2f}"
 )
@@ -1087,14 +1322,14 @@ selected_row = summary.loc[summary["ticker"] == selected_label].iloc[0]
 selected_data = chart_map[selected_ticker]
 
 st.subheader(f"📈 Gráfico detalhado — {selected_label}")
-fig = build_chart(
+price_fig = build_price_chart(
     selected_data,
     title=f"{selected_label} | {selected_row['decision']}",
     entry=float(selected_row["entry"]),
     stop=float(selected_row["stop"]),
     target=float(selected_row["target"]),
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(price_fig, use_container_width=True)
 
 latest_close = float(selected_row["close"])
 alert_above = safe_float(alert_above_text)
@@ -1113,7 +1348,6 @@ else:
     st.info("Nenhum alerta manual acionado no ativo selecionado.")
 
 st.subheader("Resumo operacional")
-
 r1, r2, r3, r4 = st.columns(4)
 r1.metric("Decisão", selected_row["decision"])
 r2.metric("Preço atual", format_money(selected_row["close"]))
@@ -1131,6 +1365,68 @@ r9.metric("Qtd sugerida", int(selected_row["qty"]))
 r10.metric("Valor da posição", format_money(selected_row["position_value"]))
 r11.metric("Risco por ação", format_money(selected_row["risk_per_share"]))
 r12.metric("Risco financeiro", format_money(selected_row["risk_amount"]))
+
+if run_backtest_toggle:
+    st.divider()
+    st.subheader("🧪 Backtest rápido da estratégia")
+    bt_summary, bt_trades, bt_by_ticker, bt_debug = run_backtest(
+        tickers=tickers,
+        backtest_period=backtest_period,
+        trigger_interval=trigger_interval,
+        benchmark=benchmark,
+        capital=capital,
+        risk_per_trade_pct=risk_per_trade_pct,
+        max_position_pct=max_position_pct,
+        min_rr=min_rr,
+        min_upside_pct=min_upside_pct,
+        min_liquidity_million=min_liquidity_million,
+        max_hold_bars=max_hold_bars,
+        total_cost_pct=total_cost_pct,
+    )
+
+    if bt_trades.empty:
+        st.warning("O backtest não encontrou trades com as regras atuais. Isso pode ser bom se o filtro ficou muito rígido, ou pode exigir ajuste fino.")
+        if not bt_debug.empty:
+            st.dataframe(bt_debug, use_container_width=True, hide_index=True)
+    else:
+        s = bt_summary.iloc[0]
+        b1, b2, b3, b4, b5 = st.columns(5)
+        b1.metric("Trades", int(s["trades"]))
+        b2.metric("Win rate", format_pct(float(s["win_rate"])))
+        b3.metric("Lucro líquido", format_money(float(s["net_profit"])))
+        b4.metric("Profit factor", f"{s['profit_factor']:.2f}" if pd.notna(s["profit_factor"]) else "-")
+        b5.metric("Drawdown máx.", format_pct(float(s["max_drawdown"])))
+
+        b6, b7, b8, b9, b10 = st.columns(5)
+        b6.metric("Capital final", format_money(float(s["final_equity"])))
+        b7.metric("Payoff", f"{s['payoff']:.2f}" if pd.notna(s["payoff"]) else "-")
+        b8.metric("Expectância (R)", f"{s['expectancy_r']:.2f}" if pd.notna(s["expectancy_r"]) else "-")
+        b9.metric("Vencedores", int(s["wins"]))
+        b10.metric("Perdedores", int(s["losses"]))
+
+        equity_fig = build_equity_chart(bt_trades, capital)
+        st.plotly_chart(equity_fig, use_container_width=True)
+
+        with st.expander("📊 Resultado por ativo"):
+            view_bt = bt_by_ticker.copy()
+            view_bt.columns = ["Ticker", "Trades", "Lucro líquido", "Win rate", "Média em R", "Score médio"]
+            view_bt["Lucro líquido"] = view_bt["Lucro líquido"].map(format_money)
+            view_bt["Win rate"] = view_bt["Win rate"].map(format_pct)
+            view_bt["Média em R"] = view_bt["Média em R"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+            view_bt["Score médio"] = view_bt["Score médio"].map(lambda x: f"{x:.1f}")
+            st.dataframe(view_bt, use_container_width=True, hide_index=True)
+
+        with st.expander("🧾 Log de trades do backtest"):
+            view_trades = bt_trades.copy()
+            view_trades["entry"] = view_trades["entry"].map(format_money)
+            view_trades["exit"] = view_trades["exit"].map(format_money)
+            view_trades["stop"] = view_trades["stop"].map(format_money)
+            view_trades["target"] = view_trades["target"].map(format_money)
+            view_trades["pnl"] = view_trades["pnl"].map(format_money)
+            view_trades["ret_capital"] = view_trades["ret_capital"].map(format_pct)
+            view_trades["r_multiple"] = view_trades["r_multiple"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+            view_trades["score"] = view_trades["score"].map(lambda x: f"{x:.0f}")
+            st.dataframe(view_trades, use_container_width=True, hide_index=True)
 
 with st.expander("Como o robô decide"):
     st.markdown(
@@ -1152,7 +1448,13 @@ with st.expander("Como o robô decide"):
         - quantidade inviável
         - posição acima do capital
         - posição acima da exposição máxima
+
+        **Backtest desta V5:**
+        - entra apenas quando a decisão é **OPERAR AGORA**
+        - sai no **alvo**, **stop** ou **tempo máximo em candles**
+        - desconta **custo total por trade**
+        - mostra lucro líquido, drawdown, payoff e expectância em R
         """
     )
 
-st.caption("Uso educacional. Não é garantia de lucro e não substitui gerenciamento de risco, backtest e disciplina operacional.")
+st.caption("Uso educacional. Não é garantia de lucro e não substitui gerenciamento de risco, backtest amplo, taxas reais e disciplina operacional.")
