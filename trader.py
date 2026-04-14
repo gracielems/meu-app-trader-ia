@@ -461,6 +461,10 @@ def evaluate_asset_from_indicator_frames(
     max_position_pct: float,
     min_upside_pct: float,
     min_liquidity_million: float,
+    entry_min_rvol: float,
+    entry_max_rsi: float,
+    entry_min_score: float,
+    require_breakout: bool,
 ) -> Dict[str, float]:
     if daily.empty:
         raise ValueError("diário sem indicadores")
@@ -500,6 +504,8 @@ def evaluate_asset_from_indicator_frames(
     trigger_ema9 = float(t["EMA9"])
     trigger_ema21 = float(t["EMA21"])
     trigger_vwap = float(t["VWAP"]) if pd.notna(t["VWAP"]) else np.nan
+    prev_trigger_high = float(trigger.iloc[-2]["High"]) if len(trigger) >= 2 else close_trigger
+    breakout_ok = close_trigger > prev_trigger_high
     trigger_rsi = float(t["RSI14"])
     trigger_rvol = float(t["RVOL"])
     trigger_vol = float(t["Volatilidade20"])
@@ -558,6 +564,13 @@ def evaluate_asset_from_indicator_frames(
     else:
         score -= 4
 
+    if breakout_ok:
+        score += 8
+        strengths.append("Rompimento confirmado")
+    else:
+        score -= 4
+        alerts.append("Sem rompimento de curto prazo")
+
     if 54 <= trigger_rsi <= 68:
         score += 10
         strengths.append("Momentum saudável")
@@ -576,9 +589,12 @@ def evaluate_asset_from_indicator_frames(
         strengths.append("Volume forte")
     elif trigger_rvol >= 1.1:
         score += 6
-    elif trigger_rvol < 0.8:
-        score -= 15
-        alerts.append("RVOL muito fraco")
+    elif trigger_rvol < entry_min_rvol:
+        score -= 18
+        alerts.append("RVOL abaixo do mínimo de entrada")
+    else:
+        score -= 8
+        alerts.append("RVOL moderado")
 
     if pd.notna(rel_strength):
         if rel_strength > 0.03:
@@ -633,8 +649,12 @@ def evaluate_asset_from_indicator_frames(
         hard_blocks.append("Gatilho abaixo da EMA21")
     if pd.notna(trigger_vwap) and close_trigger <= trigger_vwap:
         hard_blocks.append("Preço abaixo da VWAP")
-    if trigger_rvol < 0.80:
-        hard_blocks.append("RVOL abaixo de 0.80")
+    if trigger_rvol < entry_min_rvol:
+        hard_blocks.append(f"RVOL abaixo de {entry_min_rvol:.2f}")
+    if trigger_rsi > entry_max_rsi:
+        hard_blocks.append(f"RSI acima de {entry_max_rsi:.0f}")
+    if require_breakout and not breakout_ok:
+        hard_blocks.append("Sem rompimento confirmado")
     if levels["rr"] < min_rr:
         hard_blocks.append("Risco/retorno abaixo do mínimo")
     if pd.notna(upside_pct) and upside_pct < min_upside_pct:
@@ -647,6 +667,8 @@ def evaluate_asset_from_indicator_frames(
         hard_blocks.append("Excede o capital disponível")
     if position["position_pct"] > max_position_pct:
         hard_blocks.append("Excede exposição máxima")
+    if score < entry_min_score:
+        hard_blocks.append(f"Score abaixo de {entry_min_score:.0f}")
 
     score = max(min(score, 100), 0)
 
@@ -705,6 +727,10 @@ def build_summary(
     min_rr: float,
     min_upside_pct: float,
     min_liquidity_million: float,
+    entry_min_rvol: float,
+    entry_max_rsi: float,
+    entry_min_score: float,
+    require_breakout: bool,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, float], pd.DataFrame]:
     rows = []
     chart_map: Dict[str, pd.DataFrame] = {}
@@ -749,6 +775,10 @@ def build_summary(
                 max_position_pct=max_position_pct,
                 min_upside_pct=min_upside_pct,
                 min_liquidity_million=min_liquidity_million,
+                entry_min_rvol=entry_min_rvol,
+                entry_max_rsi=entry_max_rsi,
+                entry_min_score=entry_min_score,
+                require_breakout=require_breakout,
             )
 
             rows.append(evaluated)
@@ -803,6 +833,7 @@ def simulate_trade_path(
     qty: int,
     max_hold_bars: int,
     total_cost_pct: float,
+    breakeven_r: float,
 ) -> Tuple[int, float, str, float]:
     end_idx = min(start_idx + max_hold_bars, len(trigger_ind) - 1)
     if end_idx <= start_idx:
@@ -816,27 +847,38 @@ def simulate_trade_path(
     exit_price = float(trigger_ind.iloc[end_idx]["Close"])
     reason = "tempo esgotado"
 
+    risk_per_share = max(entry - stop, 0)
+    be_trigger = entry + (risk_per_share * breakeven_r)
+    stop_level = stop
+    breakeven_armed = False
+
     for j in range(start_idx + 1, end_idx + 1):
         row = trigger_ind.iloc[j]
         high = float(row["High"])
         low = float(row["Low"])
         close = float(row["Close"])
 
-        if low <= stop and high >= target:
+        if low <= stop_level and high >= target:
             exit_idx = j
-            exit_price = stop
-            reason = "ambíguo, assumido stop"
+            exit_price = stop_level
+            reason = "ambíguo, assumido stop/breakeven"
             break
-        if low <= stop:
+
+        if low <= stop_level:
             exit_idx = j
-            exit_price = stop
-            reason = "stop"
+            exit_price = stop_level
+            reason = "breakeven" if breakeven_armed and stop_level >= entry else "stop"
             break
+
         if high >= target:
             exit_idx = j
             exit_price = target
             reason = "alvo"
             break
+
+        if (not breakeven_armed) and risk_per_share > 0 and high >= be_trigger:
+            breakeven_armed = True
+            stop_level = entry
 
         exit_idx = j
         exit_price = close
@@ -861,6 +903,11 @@ def run_backtest(
     min_liquidity_million: float,
     max_hold_bars: int,
     total_cost_pct: float,
+    entry_min_rvol: float,
+    entry_max_rsi: float,
+    entry_min_score: float,
+    require_breakout: bool,
+    breakeven_r: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     trades: List[Dict] = []
     debug_rows: List[Dict] = []
@@ -979,6 +1026,10 @@ def run_backtest(
                     max_position_pct=max_position_pct,
                     min_upside_pct=min_upside_pct,
                     min_liquidity_million=min_liquidity_million,
+                    entry_min_rvol=entry_min_rvol,
+                    entry_max_rsi=entry_max_rsi,
+                    entry_min_score=entry_min_score,
+                    require_breakout=require_breakout,
                 )
 
                 if evaluated["decision"] != "OPERAR AGORA":
@@ -1004,6 +1055,7 @@ def run_backtest(
                     qty=qty,
                     max_hold_bars=max_hold_bars,
                     total_cost_pct=total_cost_pct,
+                    breakeven_r=breakeven_r,
                 )
 
                 r_multiple = pnl / risk_amount if risk_amount > 0 else np.nan
@@ -1246,11 +1298,19 @@ with st.sidebar:
     top_n = st.slider("Quantidade de sugestões", 1, 10, 3)
 
     st.divider()
+    st.subheader("Ajuste fino do setup")
+    entry_min_rvol = st.slider("RVOL mínimo para entrada", 0.60, 2.00, 1.00, 0.05)
+    entry_max_rsi = st.slider("RSI máximo para entrada", 55, 80, 68, 1)
+    entry_min_score = st.slider("Score mínimo para entrada", 70, 100, 85, 1)
+    require_breakout = st.checkbox("Exigir rompimento confirmado", value=True)
+
+    st.divider()
     st.subheader("Backtest")
     run_backtest_toggle = st.checkbox("Mostrar backtest", value=True)
     backtest_period_label = st.selectbox("Janela do backtest", list(BACKTEST_PERIOD_OPTIONS.keys()), index=1)
-    max_hold_bars = st.slider("Máximo de candles por trade", 3, 60, 12)
+    max_hold_bars = st.slider("Máximo de candles por trade", 3, 60, 20)
     total_cost_pct = st.slider("Custo total por trade (%)", 0.0, 1.0, 0.10, 0.01) / 100
+    breakeven_r = st.slider("Mover stop para breakeven em (R)", 0.5, 2.0, 1.0, 0.1)
 
     st.divider()
     auto_refresh = st.checkbox("Atualização automática", value=False)
@@ -1297,6 +1357,10 @@ summary, chart_map, regime_info, debug_df = build_summary(
     min_rr=min_rr,
     min_upside_pct=min_upside_pct,
     min_liquidity_million=min_liquidity_million,
+    entry_min_rvol=entry_min_rvol,
+    entry_max_rsi=entry_max_rsi,
+    entry_min_score=entry_min_score,
+    require_breakout=require_breakout,
 )
 
 if summary.empty:
@@ -1493,6 +1557,11 @@ if run_backtest_toggle:
         min_liquidity_million=min_liquidity_million,
         max_hold_bars=max_hold_bars,
         total_cost_pct=total_cost_pct,
+        entry_min_rvol=entry_min_rvol,
+        entry_max_rsi=entry_max_rsi,
+        entry_min_score=entry_min_score,
+        require_breakout=require_breakout,
+        breakeven_r=breakeven_r,
     )
 
     if bt_trades.empty:
@@ -1552,13 +1621,16 @@ with st.expander("Como o robô decide"):
         - estrutura 60m fraca
         - gatilho abaixo da EMA21
         - preço abaixo da VWAP
-        - RVOL abaixo de 0.80
+        - RVOL abaixo do mínimo configurado
+        - RSI acima do limite de entrada
+        - falta de rompimento confirmado quando exigido
         - risco/retorno abaixo do mínimo
         - potencial abaixo do mínimo
         - liquidez abaixo do mínimo
         - quantidade inviável
         - posição acima do capital
         - posição acima da exposição máxima
+        - score abaixo do mínimo de entrada
 
         **Backtest desta V5:**
         - entra apenas quando a decisão é **OPERAR AGORA**
