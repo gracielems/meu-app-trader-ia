@@ -1,4 +1,4 @@
-import math
+       import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -114,6 +114,11 @@ def _prepare_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if not required_cols.issubset(df.columns):
         return pd.DataFrame()
 
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+
+    df = df[~df.index.isna()].sort_index().copy()
     df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
     return df
 
@@ -313,7 +318,17 @@ def get_regime_info_at(regime_table: pd.DataFrame, timestamp) -> Dict[str, float
             "ret20": np.nan,
         }
 
-    subset = regime_table.loc[regime_table.index <= timestamp]
+    regime_table = regime_table.copy()
+    regime_table.index = pd.to_datetime(regime_table.index, errors="coerce")
+    regime_table = regime_table[~regime_table.index.isna()].sort_index()
+
+    ts = pd.Timestamp(timestamp)
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    ts = pd.Timestamp(ts.to_datetime64())
+
+    idx = pd.DatetimeIndex(regime_table.index)
+    subset = regime_table.loc[idx <= ts]
     if subset.empty:
         row = regime_table.iloc[0]
     else:
@@ -942,7 +957,7 @@ def run_backtest(
             i = 0
             trades_count = 0
             while i < len(trigger_ind) - 1:
-                ts = trigger_ind.index[i]
+                ts = pd.Timestamp(trigger_ind.index[i])
                 daily_slice = daily_ind.loc[daily_ind.index <= ts]
                 structure_slice = structure_ind.loc[structure_ind.index <= ts]
                 trigger_slice = trigger_ind.iloc[: i + 1]
@@ -1554,3 +1569,5 @@ with st.expander("Como o robô decide"):
     )
 
 st.caption("Uso educacional. Não é garantia de lucro e não substitui gerenciamento de risco, backtest amplo, taxas reais e disciplina operacional.")
+
+st.info("Dica: se o navegador estiver traduzindo a página automaticamente, alguns textos como 'OPERAR AGORA' podem aparecer estranhos. Desative a tradução automática nesta página para ver os rótulos corretamente.")
