@@ -752,7 +752,7 @@ def evaluate_asset_from_indicator_frames(
     else:
         decision = "NÃO OPERAR"
 
-        if score >= 94 and not hard_blocks:
+    if score >= 94 and not hard_blocks:
         confidence = "A+"
         confidence_pct = 0.72
     elif score >= 88 and not hard_blocks:
