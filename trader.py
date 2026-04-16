@@ -752,6 +752,31 @@ def evaluate_asset_from_indicator_frames(
     else:
         decision = "NÃO OPERAR"
 
+        if score >= 94 and not hard_blocks:
+        confidence = "A+"
+        confidence_pct = 0.72
+    elif score >= 88 and not hard_blocks:
+        confidence = "A"
+        confidence_pct = 0.64
+    elif score >= 82 and not hard_blocks:
+        confidence = "B"
+        confidence_pct = 0.57
+    else:
+        confidence = "C"
+        confidence_pct = 0.48
+
+    risk_multiplier = 1.0
+    if confidence == "A+":
+        risk_multiplier = 1.25
+    elif confidence == "A":
+        risk_multiplier = 1.10
+    elif confidence == "B":
+        risk_multiplier = 0.90
+    else:
+        risk_multiplier = 0.75
+
+    adjusted_risk_amount = position["risk_amount"] * risk_multiplier
+
     return {
         "ticker": ticker.replace(".SA", ""),
         "score": score,
@@ -773,11 +798,14 @@ def evaluate_asset_from_indicator_frames(
         "qty": position["qty"],
         "position_value": position["position_value"],
         "position_pct": position["position_pct"],
-        "risk_amount": position["risk_amount"],
+        "risk_amount": adjusted_risk_amount,
+        "base_risk_amount": position["risk_amount"],
         "risk_per_share": position["risk_per_share"],
         "strengths": " | ".join(strengths[:7]) if strengths else "Sem destaques",
         "alerts": " | ".join(alerts[:7]) if alerts else "Sem alertas",
         "hard_blocks": " | ".join(hard_blocks) if hard_blocks else "Sem bloqueios",
+        "confidence": confidence,
+        "confidence_pct": confidence_pct,
         "strong_candle": strong_candle,
         "breakout_ok": breakout_ok,
         "time_ok": time_ok,
@@ -875,9 +903,10 @@ def build_summary(
     summary["ranking"] = (
         summary["score"]
         + summary["upside_pct"].fillna(0) * 100
-        - summary["stop_pct"].fillna(0) * 50
-        + summary["relative_strength"].fillna(0) * 100
-        + summary["rvol"].fillna(0) * 5
+        - summary["stop_pct"].fillna(0) * 45
+        + summary["relative_strength"].fillna(0) * 110
+        + summary["rvol"].fillna(0) * 7
+        + summary["confidence_pct"].fillna(0) * 25
     )
     summary = summary.sort_values(by=["decision_order", "ranking", "score"], ascending=[True, False, False]).reset_index(drop=True)
     return summary, chart_map, regime_info, debug_df
@@ -1300,8 +1329,8 @@ def build_equity_chart(trades_df: pd.DataFrame) -> go.Figure:
 # =========================================================
 # INTERFACE
 # =========================================================
-st.title("📈 Robô Pessoal de Análise de Ações — V7")
-st.caption("Agora filtrando automaticamente os ativos que realmente sustentam resultado no backtest, além dos filtros intraday.")
+st.title("📈 Robô Pessoal de Análise de Ações — V8")
+st.caption("Perfil agressivo-controlado: mais ganho potencial, mas só com ativos aprovados no histórico e setups de alta confiança.")
 
 with st.sidebar:
     st.header("Configurações")
@@ -1342,6 +1371,7 @@ with st.sidebar:
     min_avg_r_asset = st.slider("Expectância mínima por ativo (R)", -0.20, 0.30, 0.00, 0.01)
     require_positive_net_profit_asset = st.checkbox("Exigir lucro líquido positivo por ativo", value=True)
     require_positive_profit_factor_asset = st.checkbox("Exigir profit factor acima de 1 por ativo", value=True)
+    profile_mode = st.selectbox("Perfil operacional", ["Agressivo-controlado", "Conservador"], index=0)
 
     st.divider()
     st.subheader("Filtro de horário")
@@ -1361,6 +1391,14 @@ with st.sidebar:
     max_trades_per_day = st.slider("Máximo de trades por dia/ativo", 1, 5, 2)
     max_consecutive_losses = st.slider("Máximo de perdas seguidas por dia/ativo", 1, 3, 2)
     one_trade_per_asset_day = st.checkbox("Só 1 trade por ativo por dia", value=False)
+
+if profile_mode == "Agressivo-controlado":
+    entry_min_rvol = min(entry_min_rvol, 0.95)
+    entry_min_score = min(entry_min_score, 82)
+    max_trades_per_day = max(max_trades_per_day, 3)
+    max_consecutive_losses = min(max_consecutive_losses, 2)
+    partial_size_pct = 0.40 if partial_size_pct > 0.40 else partial_size_pct
+    one_trade_per_asset_day = False
 
     st.divider()
     auto_refresh = st.checkbox("Atualização automática", value=False)
@@ -1546,6 +1584,7 @@ for col, (_, row) in zip(cols, top_df.iterrows()):
     with col:
         st.markdown(f"#### {signal_icon} {row['ticker']}")
         st.write(f"**Decisão:** {row['decision']}")
+        st.write(f"**Confiança:** {row['confidence']} ({row['confidence_pct'] * 100:.0f}%)")
         st.write(f"**Score:** {row['score']:.0f}")
         st.write(f"**Preço atual:** {format_money(row['close'])}")
         st.write(f"**Entrada:** {format_money(row['entry'])}")
@@ -1640,6 +1679,10 @@ r10.metric("Valor da posição", format_money(selected_row["position_value"]))
 r11.metric("Risco por ação", format_money(selected_row["risk_per_share"]))
 r12.metric("Risco financeiro", format_money(selected_row["risk_amount"]))
 
+r13, r14 = st.columns(2)
+r13.metric("Confiança do setup", f"{selected_row['confidence']} | {selected_row['confidence_pct'] * 100:.0f}%")
+r14.metric("Risco base", format_money(selected_row["base_risk_amount"]))
+
 if run_backtest_toggle:
     st.divider()
     st.subheader("🧪 Backtest rápido da estratégia")
@@ -1692,17 +1735,13 @@ with st.expander("Como o robô decide"):
         - **OBSERVAR**: ativo interessante, mas faltou confirmação.
         - **NÃO OPERAR**: o robô recusou o trade por filtro duro.
 
-        **Melhorias da V7:**
-        - filtro de horário
-        - RVOL contextual por horário
-        - rompimento confirmado
-        - candle de força
-        - parcial no 1R
-        - breakeven automático
-        - filtro do índice intraday
-        - limite de trades por dia
-        - trava por perdas seguidas no backtest
-        - filtro histórico que aprova só os ativos que performam bem
+        **Melhorias da V8 (perfil agressivo-controlado):**
+        - continua usando filtro histórico por ativo
+        - privilegia ativos com mais força relativa e RVOL
+        - adiciona nota de confiança do setup (A+, A, B, C)
+        - aumenta o risco financeiro apenas nos setups mais fortes
+        - mantém trava de horário, índice intraday e candle de força
+        - preserva o foco em operar pouco, mas com mais qualidade
 
         **Bloqueios duros atuais:**
         - fora da janela de horário
