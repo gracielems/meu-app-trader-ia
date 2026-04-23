@@ -119,29 +119,17 @@ def main():
         status = st.empty()
         tabela = st.empty()
         
-        while True:
-            status.info(f"🔄 Monitorando... Última atualização: {datetime.now().strftime('%H:%M:%S')}")
-            resultados = []
+      while True:
+            # Pega o horário atual para mostrar que está vivo
+            agora = datetime.now().strftime('%H:%M:%S')
+            status.info(f"🔄 **Monitoramento Ativo em Tempo Real** | Última varredura: {agora}")
             
-            for ticker in tickers:
-                df = load_data_brapi(ticker, intervalo)
-                if not df.empty:
-                    df = calculate_indicators(df)
-                    res = evaluate_asset(ticker, df)
-                    resultados.append(res)
-                    
-                    if res["decision"] == "OPERAR AGORA":
-                        # Alerta por hora para não spammar
-                        chave = f"{ticker}_{datetime.now().strftime('%H')}"
-                        if chave not in st.session_state.alertas:
-                            enviar_telegram(res)
-                            st.session_state.alertas.add(chave)
+            # ... (resto do código de análise igual) ...
             
-            if resultados:
-                df_final = pd.DataFrame(resultados).sort_values(by="score", ascending=False)
-                tabela.table(df_final[['ticker', 'score', 'decision', 'entry', 'stop', 'target']])
-            
+            # Em vez de apenas o rerun no final, vamos garantir o loop infinito
             time.sleep(60)
+            # O Streamlit rerun atualiza a página inteira
+            st.rerun()
             st.rerun()
 
 if __name__ == "__main__":
