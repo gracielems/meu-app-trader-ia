@@ -7,7 +7,7 @@ import streamlit as st
 # =========================================================
 # CONFIGURAÇÕES DE ACESSO (CONECTADO)
 # =========================================================
-st.set_page_config(page_title="Robô Elite B3 - Tempo Real", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Robô Elite B3 - Real Time", page_icon="🚀", layout="wide")
 
 TOKEN_TELEGRAM = "8512230023:AAGyZ0QwPmnWqnZeQKfS7KCkwcVf1fBckCY"
 ID_TELEGRAM = "7453152256"
@@ -18,7 +18,6 @@ TOKEN_BRAPI = "u4ufLNdYFG1Qo3xwHmuoem"
 # =========================================================
 
 def enviar_telegram(dados):
-    """Envia o alerta formatado para o Telegram"""
     mensagem = (
         f"🚀 **SINAL DE ELITE: {dados['ticker']}**\n\n"
         f"📊 **Score:** {dados['score']}/100\n"
@@ -37,11 +36,8 @@ def enviar_telegram(dados):
         pass
 
 def load_data_brapi(ticker, interval="15m"):
-    """Busca dados em tempo real via Brapi"""
-    # Formata o ticker para o padrão da Brapi (sem o .SA se necessário)
     t = ticker.replace(".SA", "")
     range_val = "1d" if interval in ["1m", "5m", "15m"] else "5d"
-    
     url = f"https://brapi.dev/api/quote/{t}?range={range_val}&interval={interval}&token={TOKEN_BRAPI}"
     try:
         response = requests.get(url).json()
@@ -51,12 +47,8 @@ def load_data_brapi(ticker, interval="15m"):
         df = df.rename(columns={'close': 'Close', 'open': 'Open', 'high': 'High', 'low': 'Low', 'volume': 'Volume'})
         df = df.set_index('date')
         return df
-    except Exception as e:
+    except:
         return pd.DataFrame()
-
-# =========================================================
-# INTELIGÊNCIA E ESTRATÉGIA
-# =========================================================
 
 def calculate_indicators(df):
     data = df.copy()
@@ -69,7 +61,6 @@ def calculate_indicators(df):
 
 def evaluate_asset(ticker, df):
     t = df.iloc[-1]
-    
     entry = float(t["Close"])
     stop = entry - (1.5 * float(t["ATR"]))
     target = entry + ((entry - stop) * 2.5)
@@ -79,14 +70,12 @@ def evaluate_asset(ticker, df):
     strengths = []
     blocks = []
     
-    # 1. Volume (O rastro do dinheiro institucional)
     if t["RVOL"] > 1.2:
         score += 50
         strengths.append("Fluxo Institucional")
     else:
         blocks.append("Volume Normal")
 
-    # 2. Tendência (Médias Alinhadas)
     if t["Close"] > t["EMA9"] > t["EMA21"]:
         score += 50
         strengths.append("Tendência de Alta")
@@ -102,11 +91,12 @@ def evaluate_asset(ticker, df):
     }
 
 # =========================================================
-# INTERFACE
+# INTERFACE PRINCIPAL (CORREÇÃO DE INDENTAÇÃO)
 # =========================================================
 
 def main():
-    st.title("📈 Robô Elite B3 - Tempo Real (Brapi)")
+    st.title("📈 Robô Elite B3 - Real Time")
+    
     st.sidebar.header("Configurações")
     tickers_raw = st.sidebar.text_input("Ações", "PETR4, VALE3, BBAS3, ITUB4")
     intervalo = st.sidebar.selectbox("Tempo Gráfico", ["5m", "15m", "30m", "1h"], index=1)
@@ -114,22 +104,35 @@ def main():
     if "alertas" not in st.session_state:
         st.session_state.alertas = set()
 
-    if st.sidebar.button("🚀 INICIAR MONITORAMENTO REAL-TIME"):
+    if st.sidebar.button("🚀 INICIAR MONITORAMENTO"):
         tickers = [t.strip().upper() for t in tickers_raw.split(",")]
         status = st.empty()
         tabela = st.empty()
         
-      while True:
-            # Pega o horário atual para mostrar que está vivo
+        while True:
             agora = datetime.now().strftime('%H:%M:%S')
-            status.info(f"🔄 **Monitoramento Ativo em Tempo Real** | Última varredura: {agora}")
+            status.info(f"🔄 Monitoramento Ativo | Última varredura: {agora}")
+            resultados = []
             
-            # ... (resto do código de análise igual) ...
+            for ticker in tickers:
+                df = load_data_brapi(ticker, intervalo)
+                if not df.empty:
+                    df = calculate_indicators(df)
+                    res = evaluate_asset(ticker, df)
+                    resultados.append(res)
+                    
+                    if res["decision"] == "OPERAR AGORA":
+                        chave = f"{ticker}_{datetime.now().strftime('%H')}"
+                        if chave not in st.session_state.alertas:
+                            enviar_telegram(res)
+                            st.session_state.alertas.add(chave)
             
-            # Em vez de apenas o rerun no final, vamos garantir o loop infinito
+            if resultados:
+                df_final = pd.DataFrame(resultados).sort_values(by="score", ascending=False)
+                tabela.table(df_final[['ticker', 'score', 'decision', 'entry', 'stop', 'target']])
+            
+            # Aguarda 60 segundos e força o rerun
             time.sleep(60)
-            # O Streamlit rerun atualiza a página inteira
-            st.rerun()
             st.rerun()
 
 if __name__ == "__main__":
