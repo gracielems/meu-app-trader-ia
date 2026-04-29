@@ -7,7 +7,7 @@ import streamlit as st
 st.set_page_config(page_title="Robô Elite B3", page_icon="🚀", layout="wide")
 
 # CONFIGURAÇÕES - Verifique se seu Token está correto aqui
-TOKEN_TELEGRAM = "8512230023:AAGyZ0QwPmnWqnZeQKfS7KCkwcVf1fBckCY"
+TOKEN_TELEGRAM = "8512230023:AAFm28JQEYr-2PrvwD0kKG6tVaviGjF9aoQ"
 ID_TELEGRAM = "7453152256"
 TOKEN_BRAPI = "u4ufLNdYFG1Qo3xwHmuoem"
 
