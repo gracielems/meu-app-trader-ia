@@ -6,7 +6,7 @@ import time
 # 1. CONFIGURAÇÕES (Suas chaves seguras)
 TOKEN_TELEGRAM = "8512230023:AAFm28JQEYr-2PrvwD0kKG6tVaviGjF9aoQ"
 ID_TELEGRAM = "7453152256"
-TOKEN_BRAPI = "u4ufLNdYFG1Qo3xwHmuoem"
+TOKEN_BRAPI = "jKGX2wcgeXv4ekYQsTkp7D"
 
 st.set_page_config(page_title="Robô Elite B3", layout="wide")
 
