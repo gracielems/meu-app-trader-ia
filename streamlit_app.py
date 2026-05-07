@@ -1,14 +1,19 @@
 """
-Robô Elite B3 — Analisador de ações da B3 com indicadores técnicos
-Indicadores: RSI, Médias Móveis Exponenciais (9 e 21 períodos)
+Robô Elite B3 — Monitor Contínuo de Pregão
+Indicadores: RSI (14) + EMA 9/21
+Infraestrutura: Loop de monitoramento + Log persistente + Alertas Telegram
 """
 
 import streamlit as st
 import pandas as pd
 import requests
 import pandas_ta as ta
-from datetime import datetime
-from typing import Optional, Dict, Tuple
+import logging
+import csv
+import time
+from datetime import datetime, time as dtime
+from pathlib import Path
+from typing import Dict, Optional
 
 # ---------------------------------------------------------------------------
 # CONFIGURAÇÃO DA PÁGINA
@@ -17,46 +22,264 @@ st.set_page_config(page_title="Robô Elite B3", layout="wide", page_icon="📈")
 
 
 # ---------------------------------------------------------------------------
-# PARÂMETROS DE ESTRATÉGIA
+# CAMINHOS DE LOG
+# ---------------------------------------------------------------------------
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+ARQUIVO_LOG    = LOG_DIR / "robo_b3.log"
+ARQUIVO_SINAIS = LOG_DIR / "sinais.csv"
+ARQUIVO_ORDENS = LOG_DIR / "ordens.csv"
+
+
+# ---------------------------------------------------------------------------
+# SISTEMA DE LOG
+# ---------------------------------------------------------------------------
+def configurar_logger() -> logging.Logger:
+    """Configura logger com saída simultânea em arquivo e console."""
+    logger = logging.getLogger("robo_b3")
+    if logger.handlers:
+        return logger  # já configurado em execuções anteriores do Streamlit
+
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+
+    fh = logging.FileHandler(ARQUIVO_LOG, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    return logger
+
+
+log = configurar_logger()
+
+
+# ---------------------------------------------------------------------------
+# TELEGRAM — ALERTAS E COMANDOS
+# ---------------------------------------------------------------------------
+# Emojis por tipo de sinal para deixar as mensagens mais legíveis no celular
+_EMOJI_SINAL = {
+    "COMPRA FORTE": "🚀",
+    "COMPRA":       "🟢",
+    "VENDA FORTE":  "🔥",
+    "VENDA":        "🔴",
+    "NEUTRO":       "⚪",
+}
+
+
+def enviar_telegram(mensagem: str, token: str, chat_id: str) -> bool:
+    """Envia uma mensagem de texto via Telegram Bot API.
+
+    Args:
+        mensagem: Texto a enviar (suporta Markdown v2 básico).
+        token:    Token do bot do Telegram.
+        chat_id:  ID do chat/usuário de destino.
+
+    Returns:
+        True se enviado com sucesso, False caso contrário.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id":    chat_id,
+        "text":       mensagem,
+        "parse_mode": "HTML",   # <b>, <i>, <code> funcionam bem no Telegram
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=8)
+        resp.raise_for_status()
+        log.info(f"Telegram OK — {mensagem[:60]}…")
+        return True
+    except requests.exceptions.Timeout:
+        log.warning("Telegram: timeout ao enviar mensagem")
+    except requests.exceptions.HTTPError as e:
+        log.error(f"Telegram HTTP error: {e} | resp: {resp.text[:200]}")
+    except requests.exceptions.RequestException as e:
+        log.error(f"Telegram erro de rede: {e}")
+    return False
+
+
+def montar_alerta_sinal(ticker: str, sinal: Dict, modo_sim: bool) -> str:
+    """Monta a mensagem de alerta formatada para o Telegram.
+
+    Args:
+        ticker:   Código da ação normalizado.
+        sinal:    Dicionário com tipo, força, preço, rsi e motivo.
+        modo_sim: Se True, adiciona tag de simulação na mensagem.
+    """
+    tipo      = sinal.get("tipo", "NEUTRO")
+    emoji     = _EMOJI_SINAL.get(tipo, "📊")
+    forca     = sinal.get("forca", 0)
+    preco     = sinal.get("preco", 0)
+    rsi       = sinal.get("rsi", 0)
+    motivo    = sinal.get("motivo", "")
+    agora     = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    modo_tag  = "🧪 <i>SIMULAÇÃO</i>\n" if modo_sim else "💰 <b>MODO REAL</b>\n"
+
+    return (
+        f"{modo_tag}"
+        f"{emoji} <b>SINAL: {tipo}</b>\n\n"
+        f"📌 <b>Ação:</b> <code>{ticker}</code>\n"
+        f"💵 <b>Preço:</b> R$ {preco:.2f}\n"
+        f"📊 <b>RSI:</b> {rsi:.1f}\n"
+        f"💪 <b>Força:</b> {forca}%\n"
+        f"📝 <b>Motivo:</b> {motivo}\n\n"
+        f"🕐 {agora}"
+    )
+
+
+def montar_alerta_ordem(tipo: str, ticker: str, preco: float,
+                        qtd: int, motivo: str, modo_sim: bool) -> str:
+    """Monta a mensagem de confirmação de ordem para o Telegram."""
+    emoji    = "🟢" if "COMPRA" in tipo else "🔴"
+    modo_tag = "🧪 <i>SIMULAÇÃO</i>\n" if modo_sim else "💰 <b>MODO REAL</b>\n"
+    total    = preco * qtd if qtd else 0
+    agora    = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    return (
+        f"{modo_tag}"
+        f"{emoji} <b>ORDEM: {tipo}</b>\n\n"
+        f"📌 <b>Ação:</b> <code>{ticker}</code>\n"
+        f"💵 <b>Preço:</b> R$ {preco:.2f}\n"
+        f"📦 <b>Qtd:</b> {qtd} ações\n"
+        f"💰 <b>Total:</b> R$ {total:.2f}\n"
+        f"📝 <b>Motivo:</b> {motivo}\n\n"
+        f"🕐 {agora}"
+    )
+
+
+def montar_alerta_status(ticker: str, ciclo: int, sinal: Dict) -> str:
+    """Monta relatório de status enviado a cada N ciclos ou sob demanda."""
+    tipo  = sinal.get("tipo", "NEUTRO")
+    preco = sinal.get("preco", 0)
+    rsi   = sinal.get("rsi", 0)
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    return (
+        f"📡 <b>Status do Robô</b>\n\n"
+        f"📌 <b>Ação:</b> <code>{ticker}</code>\n"
+        f"💵 <b>Preço:</b> R$ {preco:.2f}\n"
+        f"📊 <b>RSI:</b> {rsi:.1f}\n"
+        f"🔁 <b>Ciclos:</b> {ciclo}\n"
+        f"📶 <b>Último sinal:</b> {tipo}\n\n"
+        f"🕐 {agora}"
+    )
+
+
+def registrar_sinal(ticker: str, sinal: Dict) -> None:
+    """Persiste um sinal detectado no CSV de sinais.
+
+    Args:
+        ticker: Código da ação.
+        sinal:  Dicionário com tipo, força, motivo e preço.
+    """
+    cabecalho = not ARQUIVO_SINAIS.exists()
+    with open(ARQUIVO_SINAIS, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if cabecalho:
+            writer.writerow(["timestamp", "ticker", "tipo", "forca", "preco", "rsi", "motivo"])
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ticker,
+            sinal.get("tipo", ""),
+            sinal.get("forca", 0),
+            sinal.get("preco", 0),
+            f"{sinal.get('rsi', 0):.2f}" if sinal.get("rsi") else "",
+            sinal.get("motivo", ""),
+        ])
+    log.info(
+        f"SINAL | {ticker} | {sinal.get('tipo')} | "
+        f"preco={sinal.get('preco')} | RSI={sinal.get('rsi', 0):.1f} | {sinal.get('motivo')}"
+    )
+
+
+def registrar_ordem(tipo: str, ticker: str, preco: float,
+                    qtd: int, motivo: str, simulacao: bool = True) -> None:
+    """Persiste uma ordem (real ou simulada) no CSV de ordens.
+
+    Args:
+        tipo:      'COMPRA' ou 'VENDA'.
+        ticker:    Código da ação.
+        preco:     Preço de execução.
+        qtd:       Quantidade de ações.
+        motivo:    Descrição do gatilho.
+        simulacao: True = paper trade.
+    """
+    modo = "SIM" if simulacao else "REAL"
+    cabecalho = not ARQUIVO_ORDENS.exists()
+    with open(ARQUIVO_ORDENS, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if cabecalho:
+            writer.writerow(["timestamp", "modo", "tipo", "ticker",
+                             "preco", "qtd", "total", "motivo"])
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            modo, tipo, ticker,
+            f"{preco:.2f}", qtd, f"{preco * qtd:.2f}", motivo,
+        ])
+    log.info(f"ORDEM [{modo}] | {tipo} {qtd}x {ticker} @ R$ {preco:.2f} | {motivo}")
+
+
+# ---------------------------------------------------------------------------
+# HORÁRIO DE PREGÃO — B3: 10:00 – 17:30 (horário de Brasília)
+# ---------------------------------------------------------------------------
+ABERTURA_PREGAO   = dtime(10, 0)
+FECHAMENTO_PREGAO = dtime(17, 30)
+
+
+def dentro_do_pregao() -> bool:
+    """Retorna True se o horário atual estiver dentro do pregão da B3."""
+    agora = datetime.now().time()
+    return ABERTURA_PREGAO <= agora <= FECHAMENTO_PREGAO
+
+
+def status_pregao() -> Dict[str, str]:
+    """Retorna ícone e texto descrevendo o estado atual do pregão."""
+    agora = datetime.now().time()
+    if agora < ABERTURA_PREGAO:
+        return {"icone": "🕙", "texto": f"Abre às {ABERTURA_PREGAO.strftime('%H:%M')}"}
+    if agora > FECHAMENTO_PREGAO:
+        return {"icone": "🔒", "texto": "Pregão encerrado"}
+    return {"icone": "🟢", "texto": "Pregão aberto"}
+
+
+# ---------------------------------------------------------------------------
+# PARÂMETROS DA ESTRATÉGIA
 # ---------------------------------------------------------------------------
 class Parametros:
-    """Parâmetros da estratégia de trading."""
-    
-    RSI_PERIODO = 14
-    RSI_SOBRECOMPRA = 70
-    RSI_SOBREVENDA = 30
-    
-    EMA_RAPIDA = 9
-    EMA_LENTA = 21
-    
-    # Quantidade mínima de dados para calcular indicadores
-    MIN_PERIODOS = 30
+    RSI_PERIODO      = 14
+    RSI_SOBRECOMPRA  = 70
+    RSI_SOBREVENDA   = 30
+    EMA_RAPIDA       = 9
+    EMA_LENTA        = 21
+    MIN_PERIODOS     = 30
+    INTERVALO_LOOP   = 60   # segundos
 
 
 # ---------------------------------------------------------------------------
-# CONFIGURAÇÕES — lidas de st.secrets
+# CONFIGURAÇÕES
 # ---------------------------------------------------------------------------
 def carregar_config() -> dict:
-    """Retorna as credenciais lidas de st.secrets com fallback informativo."""
+    """Retorna as credenciais lidas de st.secrets."""
     try:
         return {
             "token_telegram": st.secrets["TOKEN_TELEGRAM"],
-            "id_telegram": st.secrets["ID_TELEGRAM"],
-            "token_brapi": st.secrets["TOKEN_BRAPI"],
+            "id_telegram":    st.secrets["ID_TELEGRAM"],
+            "token_brapi":    st.secrets["TOKEN_BRAPI"],
         }
     except KeyError as e:
-        st.error(
-            f"Chave ausente em st.secrets: {e}. "
-            "Crie o arquivo .streamlit/secrets.toml com as credenciais necessárias."
-        )
+        st.error(f"Chave ausente em st.secrets: {e}. Verifique .streamlit/secrets.toml.")
         st.stop()
 
 
 # ---------------------------------------------------------------------------
-# FUNÇÕES DE API
+# API
 # ---------------------------------------------------------------------------
 def normalizar_ticker(ticker: str) -> str:
-    """Garante que o ticker esteja no formato .SA para brapi.dev."""
     t = ticker.strip().upper()
     if not t.endswith(".SA"):
         t = f"{t}.SA"
@@ -64,297 +287,334 @@ def normalizar_ticker(ticker: str) -> str:
 
 
 def buscar_dados(ticker: str, token_brapi: str) -> pd.DataFrame:
-    """Busca o histórico de 5 dias / intervalo de 5 min via brapi.dev.
-    
-    Args:
-        ticker: Código da ação (ex: PETR4 ou PETR4.SA).
-        token_brapi: Token de autenticação da API brapi.dev.
-    
-    Returns:
-        DataFrame com os dados históricos ou DataFrame vazio em caso de falha.
-    """
-    t = normalizar_ticker(ticker)
+    """Busca histórico de 5d / 5min via brapi.dev."""
+    t   = normalizar_ticker(ticker)
     url = f"https://brapi.dev/api/quote/{t}?range=5d&interval=5m&token={token_brapi}"
-    
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data    = resp.json()
         results = data.get("results", [])
-        
         if not results or "historicalData" not in results[0]:
-            st.warning("A API não retornou dados históricos para este ticker.")
             return pd.DataFrame()
-        
         df = pd.DataFrame(results[0]["historicalData"])
-        
-        # Converter timestamp para datetime se existir
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], unit="s")
-        
         return df
-    
     except requests.exceptions.Timeout:
-        st.error("Tempo de conexão esgotado. Verifique sua internet e tente novamente.")
+        log.warning(f"Timeout ao buscar {t}")
     except requests.exceptions.HTTPError as e:
-        st.error(f"Erro HTTP ao acessar a API: {e}")
+        log.error(f"HTTP error {t}: {e}")
     except requests.exceptions.RequestException as e:
-        st.error(f"Erro de rede inesperado: {e}")
+        log.error(f"Rede {t}: {e}")
     except (KeyError, IndexError, ValueError) as e:
-        st.error(f"Formato de resposta inesperado da API: {e}")
-    
+        log.error(f"Parse {t}: {e}")
     return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
-# CÁLCULO DE INDICADORES TÉCNICOS
+# INDICADORES TÉCNICOS
 # ---------------------------------------------------------------------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula RSI e médias móveis exponenciais no DataFrame.
-    
-    Args:
-        df: DataFrame com pelo menos a coluna 'close'.
-    
-    Returns:
-        DataFrame com as novas colunas: rsi, ema_rapida, ema_lenta.
-    """
-    if df.empty or "close" not in df.columns:
+    if df.empty or "close" not in df.columns or len(df) < Parametros.MIN_PERIODOS:
         return df
-    
-    if len(df) < Parametros.MIN_PERIODOS:
-        st.warning(
-            f"Dados insuficientes para cálculo ({len(df)} períodos). "
-            f"Mínimo necessário: {Parametros.MIN_PERIODOS}."
-        )
-        return df
-    
-    # RSI (Relative Strength Index)
-    df["rsi"] = ta.rsi(df["close"], length=Parametros.RSI_PERIODO)
-    
-    # Médias Móveis Exponenciais
+    df["rsi"]        = ta.rsi(df["close"], length=Parametros.RSI_PERIODO)
     df["ema_rapida"] = ta.ema(df["close"], length=Parametros.EMA_RAPIDA)
-    df["ema_lenta"] = ta.ema(df["close"], length=Parametros.EMA_LENTA)
-    
+    df["ema_lenta"]  = ta.ema(df["close"], length=Parametros.EMA_LENTA)
     return df
 
 
-def analisar_sinais(df: pd.DataFrame) -> Dict[str, any]:
-    """Analisa os indicadores e retorna sinais de compra/venda.
-    
-    Args:
-        df: DataFrame com indicadores calculados.
-    
-    Returns:
-        Dicionário com tipo de sinal, força e detalhes.
-    """
+def analisar_sinais(df: pd.DataFrame) -> Dict:
     if df.empty or len(df) < 2:
         return {"tipo": "NEUTRO", "forca": 0, "motivo": "Dados insuficientes"}
-    
-    # Pega os últimos valores (mais recente)
-    ultimo = df.iloc[-1]
-    penultimo = df.iloc[-2]
-    
-    rsi_atual = ultimo.get("rsi")
-    ema_rapida_atual = ultimo.get("ema_rapida")
-    ema_lenta_atual = ultimo.get("ema_lenta")
-    
-    # Verifica se os indicadores estão disponíveis
-    if pd.isna(rsi_atual) or pd.isna(ema_rapida_atual) or pd.isna(ema_lenta_atual):
+
+    u = df.iloc[-1]
+    p = df.iloc[-2]
+
+    rsi = u.get("rsi")
+    er  = u.get("ema_rapida")
+    el  = u.get("ema_lenta")
+
+    if pd.isna(rsi) or pd.isna(er) or pd.isna(el):
         return {"tipo": "NEUTRO", "forca": 0, "motivo": "Aguardando dados suficientes"}
-    
-    preco_atual = ultimo.get("close", 0)
-    
-    # ---------------------------------------------------------------------------
-    # LÓGICA DE SINAIS
-    # ---------------------------------------------------------------------------
-    
-    # Sinal de COMPRA: RSI em sobrevenda + EMA rápida cruzou acima da lenta
-    cruzamento_alta = (
-        ema_rapida_atual > ema_lenta_atual and 
-        penultimo.get("ema_rapida", 0) <= penultimo.get("ema_lenta", 0)
-    )
-    
-    if rsi_atual < Parametros.RSI_SOBREVENDA and cruzamento_alta:
-        return {
-            "tipo": "COMPRA FORTE",
-            "forca": 90,
-            "motivo": f"RSI em sobrevenda ({rsi_atual:.1f}) + cruzamento de médias para alta",
-            "preco": preco_atual,
-            "rsi": rsi_atual,
-        }
-    
-    elif rsi_atual < Parametros.RSI_SOBREVENDA:
-        return {
-            "tipo": "COMPRA",
-            "forca": 60,
-            "motivo": f"RSI em sobrevenda ({rsi_atual:.1f})",
-            "preco": preco_atual,
-            "rsi": rsi_atual,
-        }
-    
-    elif cruzamento_alta:
-        return {
-            "tipo": "COMPRA",
-            "forca": 50,
-            "motivo": "EMA rápida cruzou acima da lenta (tendência de alta)",
-            "preco": preco_atual,
-            "rsi": rsi_atual,
-        }
-    
-    # Sinal de VENDA: RSI em sobrecompra + EMA rápida cruzou abaixo da lenta
-    cruzamento_baixa = (
-        ema_rapida_atual < ema_lenta_atual and 
-        penultimo.get("ema_rapida", 0) >= penultimo.get("ema_lenta", 0)
-    )
-    
-    if rsi_atual > Parametros.RSI_SOBRECOMPRA and cruzamento_baixa:
-        return {
-            "tipo": "VENDA FORTE",
-            "forca": 90,
-            "motivo": f"RSI em sobrecompra ({rsi_atual:.1f}) + cruzamento de médias para baixa",
-            "preco": preco_atual,
-            "rsi": rsi_atual,
-        }
-    
-    elif rsi_atual > Parametros.RSI_SOBRECOMPRA:
-        return {
-            "tipo": "VENDA",
-            "forca": 60,
-            "motivo": f"RSI em sobrecompra ({rsi_atual:.1f})",
-            "preco": preco_atual,
-            "rsi": rsi_atual,
-        }
-    
-    elif cruzamento_baixa:
-        return {
-            "tipo": "VENDA",
-            "forca": 50,
-            "motivo": "EMA rápida cruzou abaixo da lenta (tendência de baixa)",
-            "preco": preco_atual,
-            "rsi": rsi_atual,
-        }
-    
-    # Sem sinal claro
-    return {
-        "tipo": "NEUTRO",
-        "forca": 0,
-        "motivo": f"Aguardando configuração (RSI: {rsi_atual:.1f})",
-        "preco": preco_atual,
-        "rsi": rsi_atual,
-    }
+
+    preco      = u.get("close", 0)
+    cruz_alta  = er > el  and p.get("ema_rapida", 0) <= p.get("ema_lenta", 0)
+    cruz_baixa = er < el  and p.get("ema_rapida", 0) >= p.get("ema_lenta", 0)
+
+    if rsi < Parametros.RSI_SOBREVENDA and cruz_alta:
+        return {"tipo": "COMPRA FORTE", "forca": 90, "preco": preco, "rsi": rsi,
+                "motivo": f"RSI sobrevendido ({rsi:.1f}) + cruzamento EMA de alta"}
+    if rsi < Parametros.RSI_SOBREVENDA:
+        return {"tipo": "COMPRA", "forca": 60, "preco": preco, "rsi": rsi,
+                "motivo": f"RSI sobrevendido ({rsi:.1f})"}
+    if cruz_alta:
+        return {"tipo": "COMPRA", "forca": 50, "preco": preco, "rsi": rsi,
+                "motivo": "Cruzamento EMA de alta"}
+    if rsi > Parametros.RSI_SOBRECOMPRA and cruz_baixa:
+        return {"tipo": "VENDA FORTE", "forca": 90, "preco": preco, "rsi": rsi,
+                "motivo": f"RSI sobrecomprado ({rsi:.1f}) + cruzamento EMA de baixa"}
+    if rsi > Parametros.RSI_SOBRECOMPRA:
+        return {"tipo": "VENDA", "forca": 60, "preco": preco, "rsi": rsi,
+                "motivo": f"RSI sobrecomprado ({rsi:.1f})"}
+    if cruz_baixa:
+        return {"tipo": "VENDA", "forca": 50, "preco": preco, "rsi": rsi,
+                "motivo": "Cruzamento EMA de baixa"}
+
+    return {"tipo": "NEUTRO", "forca": 0, "preco": preco, "rsi": rsi,
+            "motivo": f"Sem sinal claro (RSI: {rsi:.1f})"}
 
 
 # ---------------------------------------------------------------------------
-# INTERFACE STREAMLIT
+# CICLO DE MONITORAMENTO
 # ---------------------------------------------------------------------------
-def exibir_painel_sinal(sinal: Dict) -> None:
-    """Exibe o sinal de trading em destaque."""
-    tipo = sinal.get("tipo", "NEUTRO")
+def executar_ciclo(ticker: str, config: dict) -> Optional[Dict]:
+    """Busca dados → calcula indicadores → analisa sinal → retorna sinal."""
+    log.info(f"Ciclo iniciado para {ticker}")
+    df = buscar_dados(ticker, config["token_brapi"])
+    if df.empty:
+        log.warning(f"Sem dados para {ticker}")
+        return None
+    df    = calcular_indicadores(df)
+    sinal = analisar_sinais(df)
+    if sinal["tipo"] != "NEUTRO":
+        registrar_sinal(ticker, sinal)
+    return sinal
+
+
+# ---------------------------------------------------------------------------
+# INTERFACE
+# ---------------------------------------------------------------------------
+def exibir_sinal(sinal: Dict) -> None:
+    tipo  = sinal.get("tipo", "NEUTRO")
     forca = sinal.get("forca", 0)
-    motivo = sinal.get("motivo", "")
-    
-    # Define cor baseada no tipo de sinal
     if "COMPRA" in tipo:
-        cor = "🟢"
-        estilo = "success"
+        st.success(f"### 🟢 {tipo}")
     elif "VENDA" in tipo:
-        cor = "🔴"
-        estilo = "error"
+        st.error(f"### 🔴 {tipo}")
     else:
-        cor = "⚪"
-        estilo = "info"
-    
-    st.markdown(f"### {cor} Sinal: {tipo}")
-    
-    if forca > 0:
+        st.info(f"### ⚪ {tipo}")
+    if forca:
         st.progress(forca / 100, text=f"Força do sinal: {forca}%")
-    
-    st.info(f"**Motivo:** {motivo}")
-    
-    # Exibe métricas adicionais
-    col1, col2 = st.columns(2)
-    
+    st.write(f"**Motivo:** {sinal.get('motivo', '')}")
+    c1, c2 = st.columns(2)
     if "preco" in sinal:
-        col1.metric("Preço atual", f"R$ {sinal['preco']:.2f}")
-    
+        c1.metric("Preço atual", f"R$ {sinal['preco']:.2f}")
     if "rsi" in sinal:
-        col2.metric("RSI", f"{sinal['rsi']:.1f}")
+        c2.metric("RSI", f"{sinal['rsi']:.1f}")
 
 
 def main() -> None:
-    """Ponto de entrada principal da aplicação Streamlit."""
     config = carregar_config()
-    
-    st.title("📈 Robô Elite B3 — Análise Técnica")
-    st.caption("Indicadores: RSI (14) + Médias Móveis Exponenciais (9/21)")
-    
-    # Sidebar com parâmetros
+
+    # ── Session state ─────────────────────────────────────────────────────
+    for chave, padrao in [
+        ("monitorando", False),
+        ("ultimo_sinal", None),
+        ("ciclos", 0),
+        ("ultima_atualizacao", None),
+    ]:
+        if chave not in st.session_state:
+            st.session_state[chave] = padrao
+
+    # ── Cabeçalho ─────────────────────────────────────────────────────────
+    st.title("📈 Robô Elite B3 — Monitor de Pregão")
+
+    info  = status_pregao()
+    agora = datetime.now().strftime("%H:%M:%S")
+    st.markdown(
+        f"{info['icone']} **{info['texto']}** &nbsp;·&nbsp; "
+        f"<span style='color:gray;font-size:13px'>{agora}</span>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
+    # ── Sidebar ───────────────────────────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ Configurações")
-        acao = st.text_input("Código da ação", value="BBAS3")
-        
+        acao      = st.text_input("Código da ação", value="BBAS3")
+        intervalo = st.slider("Intervalo entre ciclos (s)",
+                              min_value=30, max_value=300,
+                              value=Parametros.INTERVALO_LOOP, step=30)
+        modo_sim  = st.toggle("Modo simulação (paper trade)", value=True)
+
+        if modo_sim:
+            st.success("🧪 Paper trade — nenhuma ordem real será enviada")
+        else:
+            st.warning("⚠️ Modo real — ordens serão enviadas à corretora")
+
         st.divider()
-        st.caption(f"RSI Sobrevenda: < {Parametros.RSI_SOBREVENDA}")
-        st.caption(f"RSI Sobrecompra: > {Parametros.RSI_SOBRECOMPRA}")
-        st.caption(f"EMA Rápida: {Parametros.EMA_RAPIDA} períodos")
-        st.caption(f"EMA Lenta: {Parametros.EMA_LENTA} períodos")
-    
-    if st.button("🔍 Analisar Ação", type="primary", use_container_width=True):
-        if not acao.strip():
-            st.warning("Por favor, informe o código de uma ação.")
-            return
-        
-        ticker_normalizado = normalizar_ticker(acao)
-        
-        with st.spinner(f"Buscando dados de {ticker_normalizado}..."):
-            df = buscar_dados(acao, config["token_brapi"])
-        
-        if df.empty:
-            st.warning("Não foi possível obter dados. Mercado pode estar fechado ou ticker inválido.")
-            return
-        
-        # Calcula indicadores
-        with st.spinner("Calculando indicadores técnicos..."):
-            df = calcular_indicadores(df)
-        
-        # Analisa sinais
-        sinal = analisar_sinais(df)
-        
-        # Exibe o sinal em destaque
-        st.divider()
-        exibir_painel_sinal(sinal)
-        
-        # Exibe dados detalhados
-        st.divider()
-        st.subheader("📊 Últimos dados com indicadores")
-        
-        # Seleciona colunas relevantes para exibição
-        colunas_exibir = ["date", "close", "rsi", "ema_rapida", "ema_lenta"]
-        colunas_disponiveis = [c for c in colunas_exibir if c in df.columns]
-        
-        st.dataframe(
-            df[colunas_disponiveis].tail(20),
-            use_container_width=True,
-            hide_index=True
+        st.subheader("📲 Telegram")
+        telegram_ativo = st.toggle("Enviar alertas via Telegram", value=True)
+        alertar_neutro = st.toggle("Alertar também sinais NEUTROS", value=False)
+        freq_status    = st.number_input(
+            "Relatório de status a cada N ciclos (0 = desativado)",
+            min_value=0, max_value=100, value=10, step=5,
         )
-        
-        # Informações adicionais
-        with st.expander("ℹ️ Como interpretar os sinais"):
-            st.markdown("""
-            **Sinais de COMPRA:**
-            - RSI abaixo de 30 indica que o ativo está sobrevendido (possível alta)
-            - EMA rápida cruzando acima da lenta indica início de tendência de alta
-            - Sinal FORTE quando ambas as condições ocorrem simultaneamente
-            
-            **Sinais de VENDA:**
-            - RSI acima de 70 indica que o ativo está sobrecomprado (possível queda)
-            - EMA rápida cruzando abaixo da lenta indica início de tendência de baixa
-            - Sinal FORTE quando ambas as condições ocorrem simultaneamente
-            
-            **IMPORTANTE:** Estes são apenas indicadores técnicos. Sempre use stop loss 
-            e nunca opere com dinheiro que não pode perder.
-            """)
+        if st.button("🧪 Testar Telegram agora", use_container_width=True):
+            ok = enviar_telegram(
+                "✅ <b>Robô Elite B3</b>\nConexão com Telegram funcionando!",
+                config["token_telegram"],
+                config["id_telegram"],
+            )
+            if ok:
+                st.success("Mensagem enviada! Verifique seu Telegram.")
+            else:
+                st.error("Falha. Verifique TOKEN e ID no secrets.toml.")
+
+        st.divider()
+        st.caption(f"RSI Sobrevenda  < {Parametros.RSI_SOBREVENDA}")
+        st.caption(f"RSI Sobrecompra > {Parametros.RSI_SOBRECOMPRA}")
+        st.caption(f"EMA Rápida: {Parametros.EMA_RAPIDA} períodos")
+        st.caption(f"EMA Lenta:  {Parametros.EMA_LENTA} períodos")
+        st.divider()
+        st.caption(f"Ciclos executados: {st.session_state.ciclos}")
+        if st.session_state.ultima_atualizacao:
+            st.caption(f"Última atualização: {st.session_state.ultima_atualizacao}")
+
+    # ── Botões de controle ────────────────────────────────────────────────
+    col_ligar, col_parar = st.columns(2)
+    with col_ligar:
+        if st.button("▶️ Ligar Monitor", type="primary",
+                     use_container_width=True,
+                     disabled=st.session_state.monitorando):
+            st.session_state.monitorando = True
+            log.info(f"Monitor LIGADO — {acao.strip().upper()}")
+            if telegram_ativo:
+                enviar_telegram(
+                    f"▶️ <b>Robô Elite B3 LIGADO</b>\n"
+                    f"📌 Monitorando: <code>{normalizar_ticker(acao)}</code>\n"
+                    f"⏱ Intervalo: {intervalo}s\n"
+                    f"{'🧪 Modo simulação' if modo_sim else '💰 Modo real'}",
+                    config["token_telegram"], config["id_telegram"],
+                )
+            st.rerun()
+
+    with col_parar:
+        if st.button("⏹️ Parar Monitor",
+                     use_container_width=True,
+                     disabled=not st.session_state.monitorando):
+            st.session_state.monitorando = False
+            log.info("Monitor DESLIGADO pelo usuário")
+            if telegram_ativo:
+                enviar_telegram(
+                    f"⏹️ <b>Robô Elite B3 DESLIGADO</b>\n"
+                    f"🔁 Ciclos executados: {st.session_state.ciclos}",
+                    config["token_telegram"], config["id_telegram"],
+                )
+            st.rerun()
+
+    # ── Painel do último sinal ────────────────────────────────────────────
+    st.subheader("📡 Último sinal detectado")
+    sinal_area = st.empty()
+
+    if st.session_state.ultimo_sinal:
+        with sinal_area.container():
+            exibir_sinal(st.session_state.ultimo_sinal)
+    else:
+        sinal_area.info("Aguardando o primeiro ciclo de monitoramento…")
+
+    # ── Tabs de histórico ─────────────────────────────────────────────────
+    st.divider()
+    tab_sinais, tab_ordens, tab_log = st.tabs(["📋 Sinais", "📝 Ordens", "🗒️ Log bruto"])
+
+    with tab_sinais:
+        if ARQUIVO_SINAIS.exists():
+            df_s = pd.read_csv(ARQUIVO_SINAIS)
+            if not df_s.empty:
+                st.dataframe(df_s.sort_values("timestamp", ascending=False).head(50),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhum sinal registrado ainda.")
+        else:
+            st.info("Nenhum sinal registrado ainda.")
+
+    with tab_ordens:
+        if ARQUIVO_ORDENS.exists():
+            df_o = pd.read_csv(ARQUIVO_ORDENS)
+            if not df_o.empty:
+                st.dataframe(df_o.sort_values("timestamp", ascending=False).head(50),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhuma ordem registrada ainda.")
+        else:
+            st.info("Nenhuma ordem registrada ainda.")
+
+    with tab_log:
+        if ARQUIVO_LOG.exists():
+            linhas = ARQUIVO_LOG.read_text(encoding="utf-8").strip().splitlines()
+            st.code("\n".join(linhas[-50:]), language="text")
+        else:
+            st.info("Nenhuma entrada de log ainda.")
+
+    # ── Loop de monitoramento ─────────────────────────────────────────────
+    # O Streamlit re-executa o script inteiro a cada st.rerun().
+    # enquanto monitorando=True, um ciclo é executado e o próximo é agendado.
+    if st.session_state.monitorando:
+        if not dentro_do_pregao():
+            info_p = status_pregao()
+            st.warning(
+                f"{info_p['icone']} {info_p['texto']} — monitoramento pausado. "
+                "Será retomado automaticamente ao abrir o pregão."
+            )
+            log.info("Fora do pregão — aguardando 60s...")
+            time.sleep(60)
+            st.rerun()
+
+        ticker_norm = normalizar_ticker(acao)
+
+        with st.spinner(f"Analisando {ticker_norm}…"):
+            sinal = executar_ciclo(acao, config)
+
+        if sinal:
+            st.session_state.ultimo_sinal       = sinal
+            st.session_state.ciclos            += 1
+            st.session_state.ultima_atualizacao = datetime.now().strftime("%H:%M:%S")
+            tipo_sinal = sinal["tipo"]
+
+            # ── Envio de alerta Telegram para sinais de compra/venda ──────
+            if telegram_ativo:
+                deve_alertar = (
+                    "COMPRA" in tipo_sinal or
+                    "VENDA"  in tipo_sinal or
+                    (alertar_neutro and tipo_sinal == "NEUTRO")
+                )
+                if deve_alertar:
+                    msg = montar_alerta_sinal(ticker_norm, sinal, modo_sim)
+                    enviar_telegram(msg, config["token_telegram"], config["id_telegram"])
+
+            # ── Relatório de status periódico ─────────────────────────────
+            if (telegram_ativo and freq_status > 0
+                    and st.session_state.ciclos % freq_status == 0):
+                msg_status = montar_alerta_status(
+                    ticker_norm, st.session_state.ciclos, sinal
+                )
+                enviar_telegram(msg_status, config["token_telegram"], config["id_telegram"])
+
+            # ── Registra ordem quando há sinal de compra ou venda ─────────
+            if "COMPRA" in tipo_sinal or "VENDA" in tipo_sinal:
+                registrar_ordem(
+                    tipo=tipo_sinal,
+                    ticker=ticker_norm,
+                    preco=sinal.get("preco", 0),
+                    qtd=0,          # implementar position sizing
+                    motivo=sinal.get("motivo", ""),
+                    simulacao=modo_sim,
+                )
+                # Alerta de ordem separado do alerta de sinal
+                if telegram_ativo:
+                    msg_ordem = montar_alerta_ordem(
+                        tipo=tipo_sinal,
+                        ticker=ticker_norm,
+                        preco=sinal.get("preco", 0),
+                        qtd=0,
+                        motivo=sinal.get("motivo", ""),
+                        modo_sim=modo_sim,
+                    )
+                    enviar_telegram(msg_ordem, config["token_telegram"], config["id_telegram"])
+
+        time.sleep(intervalo)
+        st.rerun()
 
 
 if __name__ == "__main__":
