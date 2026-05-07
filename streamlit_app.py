@@ -7,7 +7,6 @@ Infraestrutura: Loop de monitoramento + Log persistente + Alertas Telegram
 import streamlit as st
 import pandas as pd
 import requests
-import pandas_ta as ta
 import logging
 import csv
 import time
@@ -313,14 +312,55 @@ def buscar_dados(ticker: str, token_brapi: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# INDICADORES TÉCNICOS
+# INDICADORES TÉCNICOS — implementados com pandas puro (sem dependências extras)
 # ---------------------------------------------------------------------------
+def calcular_rsi(serie: pd.Series, periodo: int = 14) -> pd.Series:
+    """Calcula o RSI (Relative Strength Index) usando pandas.
+
+    Args:
+        serie:   Série de preços de fechamento.
+        periodo: Número de períodos (padrão 14).
+
+    Returns:
+        Série com valores de RSI entre 0 e 100.
+    """
+    delta  = serie.diff()
+    ganho  = delta.clip(lower=0)
+    perda  = -delta.clip(upper=0)
+    media_ganho = ganho.ewm(com=periodo - 1, min_periods=periodo).mean()
+    media_perda = perda.ewm(com=periodo - 1, min_periods=periodo).mean()
+    rs  = media_ganho / media_perda.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def calcular_ema(serie: pd.Series, periodo: int) -> pd.Series:
+    """Calcula a Média Móvel Exponencial (EMA) usando pandas.
+
+    Args:
+        serie:   Série de preços de fechamento.
+        periodo: Número de períodos.
+
+    Returns:
+        Série com valores da EMA.
+    """
+    return serie.ewm(span=periodo, adjust=False).mean()
+
+
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    """Adiciona RSI e EMAs ao DataFrame.
+
+    Args:
+        df: DataFrame com pelo menos a coluna 'close'.
+
+    Returns:
+        DataFrame com as colunas rsi, ema_rapida e ema_lenta adicionadas.
+    """
     if df.empty or "close" not in df.columns or len(df) < Parametros.MIN_PERIODOS:
         return df
-    df["rsi"]        = ta.rsi(df["close"], length=Parametros.RSI_PERIODO)
-    df["ema_rapida"] = ta.ema(df["close"], length=Parametros.EMA_RAPIDA)
-    df["ema_lenta"]  = ta.ema(df["close"], length=Parametros.EMA_LENTA)
+    df["rsi"]        = calcular_rsi(df["close"],  Parametros.RSI_PERIODO)
+    df["ema_rapida"] = calcular_ema(df["close"],  Parametros.EMA_RAPIDA)
+    df["ema_lenta"]  = calcular_ema(df["close"],  Parametros.EMA_LENTA)
     return df
 
 
