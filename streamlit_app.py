@@ -217,9 +217,40 @@ def mt5_saldo() -> float:
     return info.balance if info else 0.0
 
 
-def mt5_candles(ticker: str, n: int) -> pd.DataFrame:
-    if not MT5_OK:
+def _yf_candles(ticker: str, n: int) -> pd.DataFrame:
+    """Busca candles de 5min via yfinance (fallback quando MT5 não está disponível).
+
+    yfinance disponibiliza dados intraday dos últimos 60 dias com interval='5m'.
+    """
+    import yfinance as yf
+    t = ticker.strip().upper()
+    if not t.endswith(".SA"):
+        t = f"{t}.SA"
+    try:
+        df = yf.download(t, period="5d", interval="5m",
+                         progress=False, auto_adjust=True)
+        if df.empty:
+            return pd.DataFrame()
+        # Flatten MultiIndex se necessário
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.reset_index().rename(columns={"Datetime": "time", "index": "time"})
+        if "time" not in df.columns and "Date" in df.columns:
+            df = df.rename(columns={"Date": "time"})
+        df["time"] = pd.to_datetime(df["time"])
+        # Garante que Volume existe
+        if "Volume" not in df.columns:
+            df["Volume"] = 1
+        return df[["time", "Open", "High", "Low", "Close", "Volume"]].tail(n).reset_index(drop=True)
+    except Exception as e:
+        log.error(f"yfinance erro para {t}: {e}")
         return pd.DataFrame()
+
+
+def mt5_candles(ticker: str, n: int) -> pd.DataFrame:
+    """Busca candles do MT5 (real) ou yfinance (simulação no Streamlit Cloud)."""
+    if not MT5_OK:
+        return _yf_candles(ticker, n)
     rates = mt5.copy_rates_from_pos(ticker, Config.TIMEFRAME_MT5, 0, n)
     if rates is None:
         return pd.DataFrame()
@@ -231,15 +262,19 @@ def mt5_candles(ticker: str, n: int) -> pd.DataFrame:
 
 
 def mt5_preco_ask(ticker: str) -> float:
+    """Retorna o preço ask atual. No modo sim, usa o último Close do yfinance."""
     if not MT5_OK:
-        return 0.0
+        df = _yf_candles(ticker, 1)
+        return float(df["Close"].iloc[-1]) if not df.empty else 0.0
     tick = mt5.symbol_info_tick(ticker)
     return tick.ask if tick else 0.0
 
 
 def mt5_preco_bid(ticker: str) -> float:
+    """Retorna o preço bid atual. No modo sim, usa o último Close do yfinance."""
     if not MT5_OK:
-        return 0.0
+        df = _yf_candles(ticker, 1)
+        return float(df["Close"].iloc[-1]) if not df.empty else 0.0
     tick = mt5.symbol_info_tick(ticker)
     return tick.bid if tick else 0.0
 
