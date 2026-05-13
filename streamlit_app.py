@@ -1,389 +1,913 @@
 """
-Robô Elite B3 — Backtesting
-Estratégia: RSI (14) + EMA 9/21
-Fonte de dados: yfinance (histórico gratuito e longo)
+╔══════════════════════════════════════════════════════════╗
+║         ROBÔ TUBARÃO B3 — Day Trade Semi-Automático      ║
+║  Estratégia : Price Action + VWAP + Volume Institucional ║
+║  Meta       : R$ 100/dia  |  RR mínimo: 2:1             ║
+║  Execução   : MetaTrader 5  |  Dashboard: Streamlit      ║
+╚══════════════════════════════════════════════════════════╝
 """
 
 import streamlit as st
 import pandas as pd
-import yfinance as yf
-from datetime import datetime, date
-from typing import Dict, List, Tuple
-import math
+import numpy as np
+import time
+import logging
+import csv
+import requests as _requests
+from datetime import datetime, time as dtime, date
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-st.set_page_config(page_title="Backtesting B3", layout="wide", page_icon="🔬")
+try:
+    import MetaTrader5 as mt5
+    MT5_OK = True
+except ImportError:
+    MT5_OK = False
 
-
-# ---------------------------------------------------------------------------
-# PARÂMETROS
-# ---------------------------------------------------------------------------
-class Parametros:
-    RSI_PERIODO     = 14
-    RSI_SOBREVENDA  = 30
-    RSI_SOBRECOMPRA = 70
-    EMA_RAPIDA      = 9
-    EMA_LENTA       = 21
-    MIN_PERIODOS    = 30
+st.set_page_config(page_title="Tubarão B3", layout="wide", page_icon="🦈")
 
 
-# ---------------------------------------------------------------------------
-# INDICADORES (pandas puro)
-# ---------------------------------------------------------------------------
-def calcular_rsi(serie: pd.Series, periodo: int = 14) -> pd.Series:
-    delta       = serie.diff()
-    ganho       = delta.clip(lower=0)
-    perda       = (-delta).clip(lower=0)
-    media_ganho = ganho.ewm(alpha=1 / periodo, min_periods=periodo, adjust=False).mean()
-    media_perda = perda.ewm(alpha=1 / periodo, min_periods=periodo, adjust=False).mean()
-    rs          = media_ganho / media_perda.replace(0, float("nan"))
-    return 100 - (100 / (1 + rs))
+# ═══════════════════════════════════════════════════════════
+# CONFIGURAÇÕES FIXAS DE PREGÃO
+# ═══════════════════════════════════════════════════════════
+ABERTURA          = dtime(10, 0)
+INICIO_OPERACOES  = dtime(10, 15)   # aguarda estabilizar após abertura
+FECHAMENTO_ORDENS = dtime(17, 10)   # para de abrir novas posições
+FECHAMENTO_FORCADO= dtime(17, 25)   # fecha tudo — day trade não vira swing
 
 
-def calcular_ema(serie: pd.Series, periodo: int) -> pd.Series:
-    return serie.ewm(span=periodo, min_periods=periodo, adjust=False).mean()
+# ═══════════════════════════════════════════════════════════
+# PARÂMETROS DA ESTRATÉGIA TUBARÃO
+# ═══════════════════════════════════════════════════════════
+class Config:
+    # Timeframe principal
+    TIMEFRAME_NOME   = "5min"
+    TIMEFRAME_MT5    = mt5.TIMEFRAME_M5 if MT5_OK else 5
+    N_CANDLES        = 200
+
+    # Gestão de risco DIÁRIA — inegociável
+    META_DIA         = 100.0    # R$ — para ao atingir
+    PERDA_MAX_DIA    = 60.0     # R$ — trava o robô se perder isso no dia
+    RISCO_POR_TRADE  = 0.02     # 2% do capital por operação
+    RR_MINIMO        = 2.0      # Take Profit = 2x o Stop Loss (RR 2:1)
+    MAX_TRADES_DIA   = 5        # limite de operações por dia
+
+    # Volume institucional
+    VOLUME_MULT      = 1.5      # candle com volume > 1.5x a média = institucional
+
+    # ATR para stop dinâmico
+    ATR_PERIODO      = 14
+    ATR_MULT_STOP    = 1.5      # stop = 1.5x ATR
 
 
-def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+# ═══════════════════════════════════════════════════════════
+# LOGS
+# ═══════════════════════════════════════════════════════════
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+ARQ_LOG    = LOG_DIR / "tubarao.log"
+ARQ_ORDENS = LOG_DIR / "ordens.csv"
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("tubarao_b3")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    for h in [logging.FileHandler(ARQ_LOG, encoding="utf-8"), logging.StreamHandler()]:
+        h.setFormatter(fmt)
+        logger.addHandler(h)
+    return logger
+
+
+log = _get_logger()
+
+
+def salvar_ordem(tipo: str, ticker: str, preco: float, qtd: int,
+                 motivo: str, simulacao: bool, resultado: float = 0.0) -> None:
+    modo = "SIM" if simulacao else "REAL"
+    novo = not ARQ_ORDENS.exists()
+    with open(ARQ_ORDENS, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if novo:
+            w.writerow(["data", "hora", "modo", "tipo", "ticker",
+                        "preco", "qtd", "total", "resultado", "motivo"])
+        w.writerow([date.today().isoformat(), datetime.now().strftime("%H:%M:%S"),
+                    modo, tipo, ticker, f"{preco:.2f}", qtd,
+                    f"{preco*qtd:.2f}", f"{resultado:.2f}", motivo])
+    log.info(f"[{modo}] {tipo} {qtd}x {ticker} @ R${preco:.2f} | {motivo}")
+
+
+# ═══════════════════════════════════════════════════════════
+# TELEGRAM
+# ═══════════════════════════════════════════════════════════
+def tg_send(msg: str, token: str, chat_id: str) -> None:
+    if not token:
+        return
+    try:
+        _requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=8,
+        )
+    except Exception as e:
+        log.warning(f"Telegram: {e}")
+
+
+def tg_entrada(ticker: str, tipo: str, preco: float, qtd: int,
+               sl: float, tp: float, motivo: str, sim: bool) -> str:
+    emoji = "🟢" if tipo == "COMPRA" else "🔴"
+    modo  = "🧪 SIM" if sim else "💰 REAL"
+    rr    = round(abs(tp - preco) / abs(preco - sl), 1) if preco != sl else 0
+    return (
+        f"{modo} · {emoji} <b>{tipo}</b>\n\n"
+        f"📌 <code>{ticker}</code> · R$ {preco:.2f}\n"
+        f"🎯 TP: R$ {tp:.2f}  |  🛑 SL: R$ {sl:.2f}\n"
+        f"⚖️ RR: 1:{rr}  |  📦 {qtd} ações\n"
+        f"💡 {motivo}\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+    )
+
+
+def tg_resultado(ticker: str, pl_trade: float, pl_dia: float,
+                 n_trades: int, motivo: str, sim: bool) -> str:
+    emoji = "💰" if pl_trade >= 0 else "🔻"
+    sinal = "+" if pl_trade >= 0 else ""
+    modo  = "🧪 SIM" if sim else "💰 REAL"
+    barra_dia = "▓" * int(min(pl_dia / Config.META_DIA * 10, 10)) + \
+                "░" * max(0, 10 - int(pl_dia / Config.META_DIA * 10))
+    return (
+        f"{modo} · {emoji} <b>FECHAMENTO</b>\n\n"
+        f"📌 <code>{ticker}</code>\n"
+        f"Trade: <b>R$ {sinal}{pl_trade:.2f}</b>\n"
+        f"Dia  : <b>R$ {pl_dia:+.2f}</b> / meta R$ {Config.META_DIA:.0f}\n"
+        f"[{barra_dia}] {pl_dia/Config.META_DIA*100:.0f}%\n"
+        f"🔁 {n_trades} trades · {motivo}\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+    )
+
+
+def tg_alerta_risco(motivo: str, pl_dia: float, sim: bool) -> str:
+    modo = "🧪 SIM" if sim else "💰 REAL"
+    return (
+        f"{modo} · ⚠️ <b>ROBÔ TRAVADO</b>\n\n"
+        f"🛑 {motivo}\n"
+        f"💵 P&L do dia: R$ {pl_dia:+.2f}\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+# GESTÃO DE RISCO DIÁRIA — INEGOCIÁVEL
+# ═══════════════════════════════════════════════════════════
+def check_risk_management() -> Tuple[bool, str]:
+    """Verifica se o robô pode operar com base nas regras diárias.
+
+    Returns:
+        (pode_operar: bool, motivo: str)
+    """
+    pl_dia   = st.session_state.get("pl_dia", 0.0)
+    n_trades = st.session_state.get("n_trades_dia", 0)
+
+    # Meta atingida — protege o lucro
+    if pl_dia >= Config.META_DIA:
+        return False, f"🎯 Meta diária atingida (R$ {pl_dia:.2f}). Parabéns! Robô encerrado."
+
+    # Perda máxima — protege o capital
+    if pl_dia <= -Config.PERDA_MAX_DIA:
+        return False, f"🛑 Perda máxima diária atingida (R$ {pl_dia:.2f}). Capital protegido."
+
+    # Limite de trades
+    if n_trades >= Config.MAX_TRADES_DIA:
+        return False, f"🔁 Limite de {Config.MAX_TRADES_DIA} trades/dia atingido."
+
+    # Horário
+    agora = datetime.now().time()
+    if agora < INICIO_OPERACOES:
+        return False, f"⏳ Aguardando estabilização do mercado (início: {INICIO_OPERACOES.strftime('%H:%M')})"
+    if agora >= FECHAMENTO_ORDENS:
+        return False, f"🔒 Sem novas entradas após {FECHAMENTO_ORDENS.strftime('%H:%M')}"
+
+    return True, "OK"
+
+
+# ═══════════════════════════════════════════════════════════
+# MT5 — CONEXÃO E EXECUÇÃO
+# ═══════════════════════════════════════════════════════════
+def mt5_conectar() -> bool:
+    if not MT5_OK:
+        return False
+    if not mt5.initialize():
+        log.error(f"MT5 init falhou: {mt5.last_error()}")
+        return False
+    info = mt5.account_info()
+    if not info:
+        log.error("MT5: nenhuma conta conectada")
+        return False
+    log.info(f"MT5 OK | {info.login} | {info.company} | R$ {info.balance:.2f}")
+    return True
+
+
+def mt5_saldo() -> float:
+    if not MT5_OK:
+        return st.session_state.get("capital_sim", 1000.0)
+    info = mt5.account_info()
+    return info.balance if info else 0.0
+
+
+def mt5_candles(ticker: str, n: int) -> pd.DataFrame:
+    if not MT5_OK:
+        return pd.DataFrame()
+    rates = mt5.copy_rates_from_pos(ticker, Config.TIMEFRAME_MT5, 0, n)
+    if rates is None:
+        return pd.DataFrame()
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    return df.rename(columns={"close": "Close", "open": "Open",
+                               "high": "High", "low": "Low",
+                               "tick_volume": "Volume"})
+
+
+def mt5_preco_ask(ticker: str) -> float:
+    if not MT5_OK:
+        return 0.0
+    tick = mt5.symbol_info_tick(ticker)
+    return tick.ask if tick else 0.0
+
+
+def mt5_preco_bid(ticker: str) -> float:
+    if not MT5_OK:
+        return 0.0
+    tick = mt5.symbol_info_tick(ticker)
+    return tick.bid if tick else 0.0
+
+
+def mt5_abrir_compra(ticker: str, qtd: int, sl: float, tp: float,
+                     simulacao: bool) -> Optional[float]:
+    if simulacao:
+        p = mt5_preco_ask(ticker) or st.session_state.get("preco_sim", 10.0)
+        log.info(f"[SIM] COMPRA {qtd}x {ticker} @ R${p:.2f} SL:{sl:.2f} TP:{tp:.2f}")
+        return p
+    preco = mt5_preco_ask(ticker)
+    req = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       ticker,
+        "volume":       float(qtd),
+        "type":         mt5.ORDER_TYPE_BUY,
+        "price":        preco,
+        "sl":           sl,
+        "tp":           tp,
+        "deviation":    10,
+        "magic":        20250101,
+        "comment":      "Tubarao B3",
+        "type_time":    mt5.ORDER_TIME_DAY,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    res = mt5.order_send(req)
+    if res.retcode != mt5.TRADE_RETCODE_DONE:
+        log.error(f"COMPRA falhou: {res.retcode} {res.comment}")
+        return None
+    return res.price
+
+
+def mt5_fechar_posicao(ticker: str, qtd: int, simulacao: bool,
+                       motivo: str = "") -> Optional[float]:
+    if simulacao:
+        p = mt5_preco_bid(ticker) or st.session_state.get("preco_sim", 10.0)
+        log.info(f"[SIM] VENDA {qtd}x {ticker} @ R${p:.2f} | {motivo}")
+        return p
+    positions = mt5.positions_get(symbol=ticker)
+    if not positions:
+        log.warning(f"Sem posição aberta em {ticker}")
+        return None
+    pos   = positions[0]
+    preco = mt5_preco_bid(ticker)
+    req = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       ticker,
+        "volume":       float(pos.volume),
+        "type":         mt5.ORDER_TYPE_SELL,
+        "position":     pos.ticket,
+        "price":        preco,
+        "deviation":    10,
+        "magic":        20250101,
+        "comment":      motivo or "Tubarao B3",
+        "type_time":    mt5.ORDER_TIME_DAY,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    res = mt5.order_send(req)
+    if res.retcode != mt5.TRADE_RETCODE_DONE:
+        log.error(f"VENDA falhou: {res.retcode} {res.comment}")
+        return None
+    return res.price
+
+
+# ═══════════════════════════════════════════════════════════
+# INDICADORES TUBARÃO (pandas puro)
+# ═══════════════════════════════════════════════════════════
+def calcular_vwap(df: pd.DataFrame) -> pd.Series:
+    """VWAP intradiário — reseta a cada dia.
+
+    Preço justo do dia. Comprar abaixo = comprar barato (como institucional).
+    Vender acima = realizar com lucro.
+    """
     df = df.copy()
-    df["rsi"]        = calcular_rsi(df["Close"], Parametros.RSI_PERIODO)
-    df["ema_rapida"] = calcular_ema(df["Close"], Parametros.EMA_RAPIDA)
-    df["ema_lenta"]  = calcular_ema(df["Close"], Parametros.EMA_LENTA)
-    return df.dropna(subset=["rsi", "ema_rapida", "ema_lenta"]).reset_index()
+    preco_tipico = (df["High"] + df["Low"] + df["Close"]) / 3
+    df["_data"]  = pd.to_datetime(df["time"]).dt.date if "time" in df.columns else date.today()
+
+    vwap_values = []
+    for _, grupo in df.groupby("_data"):
+        vol_cum = grupo["Volume"].cumsum()
+        pvol    = (preco_tipico.loc[grupo.index] * grupo["Volume"]).cumsum()
+        vwap    = pvol / vol_cum.replace(0, np.nan)
+        vwap_values.append(vwap)
+
+    return pd.concat(vwap_values).reindex(df.index)
 
 
-# ---------------------------------------------------------------------------
-# GERAÇÃO DE SINAIS
-# ---------------------------------------------------------------------------
-def gerar_sinais(df: pd.DataFrame) -> pd.DataFrame:
-    """Adiciona coluna 'sinal': 1 = compra, -1 = venda, 0 = neutro."""
+def calcular_atr(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
+    """Average True Range — mede a volatilidade real do mercado."""
+    hl  = df["High"] - df["Low"]
+    hc  = (df["High"] - df["Close"].shift()).abs()
+    lc  = (df["Low"]  - df["Close"].shift()).abs()
+    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.ewm(span=periodo, adjust=False).mean()
+
+
+def calcular_volume_media(df: pd.DataFrame, periodo: int = 20) -> pd.Series:
+    """Média móvel do volume — base para identificar volume institucional."""
+    return df["Volume"].rolling(periodo).mean()
+
+
+def identificar_swings(df: pd.DataFrame, janela: int = 5) -> pd.DataFrame:
+    """Identifica swing highs e lows (zonas de liquidez).
+
+    Grandes players deixam ordens paradas nessas regiões.
+    """
     df = df.copy()
-    df["sinal"] = 0
+    df["swing_high"] = df["High"][(df["High"] == df["High"].rolling(janela, center=True).max())]
+    df["swing_low"]  = df["Low"][(df["Low"]  == df["Low"].rolling(janela, center=True).min())]
+    return df
 
-    for i in range(1, len(df)):
-        rsi = df.at[i, "rsi"]
-        er  = df.at[i, "ema_rapida"]
-        el  = df.at[i, "ema_lenta"]
-        er_ant = df.at[i - 1, "ema_rapida"]
-        el_ant = df.at[i - 1, "ema_lenta"]
 
-        cruz_alta  = er > el  and er_ant <= el_ant
-        cruz_baixa = er < el  and er_ant >= el_ant
+def calcular_todos_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula todos os indicadores da estratégia Tubarão."""
+    if df.empty or len(df) < 50:
+        return df
+    df = df.copy()
+    df["vwap"]        = calcular_vwap(df)
+    df["atr"]         = calcular_atr(df, Config.ATR_PERIODO)
+    df["vol_media"]   = calcular_volume_media(df)
+    df["vol_rel"]     = df["Volume"] / df["vol_media"]          # > 1.5 = institucional
+    df["acima_vwap"]  = df["Close"] > df["vwap"]
+    df = identificar_swings(df)
 
-        if rsi < Parametros.RSI_SOBREVENDA or cruz_alta:
-            df.at[i, "sinal"] = 1
-        elif rsi > Parametros.RSI_SOBRECOMPRA or cruz_baixa:
-            df.at[i, "sinal"] = -1
+    # Corpo e direção do candle
+    df["corpo"]       = df["Close"] - df["Open"]
+    df["corpo_pct"]   = df["corpo"] / df["Open"] * 100
+    df["tocha_alta"]  = (df["Close"] > df["Open"])              # candle de alta
+    df["tocha_baixa"] = (df["Close"] < df["Open"])              # candle de baixa
 
     return df
 
 
-# ---------------------------------------------------------------------------
-# SIMULAÇÃO DE TRADES
-# ---------------------------------------------------------------------------
-def simular_trades(
-    df: pd.DataFrame,
-    capital_inicial: float,
-    risco_pct: float,
-    stop_loss_pct: float,
-    take_profit_pct: float,
-) -> Tuple[List[Dict], pd.Series]:
-    """Simula operações de compra e venda com stop loss e take profit.
+# ═══════════════════════════════════════════════════════════
+# ENGINE DE SINAL — ESTRATÉGIA TUBARÃO
+# ═══════════════════════════════════════════════════════════
+def analisar_sinal_tubarao(df: pd.DataFrame, capital: float) -> Dict:
+    """Analisa o fluxo institucional e retorna sinal de entrada.
 
-    Args:
-        df:              DataFrame com sinais gerados.
-        capital_inicial: Capital em reais.
-        risco_pct:       % do capital arriscado por trade (ex: 0.01 = 1%).
-        stop_loss_pct:   % de queda para acionar stop (ex: 0.015 = 1.5%).
-        take_profit_pct: % de alta para realizar lucro (ex: 0.03 = 3%).
-
-    Returns:
-        Lista de trades executados e série de evolução do capital.
+    Lógica Tubarão:
+    - COMPRA: preço recua ao VWAP/suporte + toque em swing low +
+              volume institucional + candle de reversão de alta
+    - VENDA : preço chega a resistência/swing high + volume institucional
+              + candle de reversão de baixa + acima do VWAP
     """
-    trades: List[Dict] = []
-    capital   = capital_inicial
-    capital_historico = [capital]
+    if df.empty or len(df) < 3:
+        return {"tipo": "NEUTRO", "forca": 0, "motivo": "Dados insuficientes"}
 
-    em_posicao      = False
-    preco_entrada   = 0.0
-    qtd_acoes       = 0
-    stop_loss       = 0.0
-    take_profit     = 0.0
-    data_entrada    = None
-    motivo_entrada  = ""
+    for col in ["vwap", "atr", "vol_rel"]:
+        if col not in df.columns or df[col].isna().all():
+            return {"tipo": "NEUTRO", "forca": 0, "motivo": "Aguardando indicadores"}
 
-    for i in range(len(df)):
-        row   = df.iloc[i]
-        preco = row["Close"]
-        data  = row["Date"] if "Date" in df.columns else row.get("Datetime", row.name)
+    u  = df.iloc[-1]   # candle atual
+    p  = df.iloc[-2]   # candle anterior
+    p2 = df.iloc[-3]   # 2 candles atrás
 
-        if em_posicao:
-            # Verifica stop loss e take profit
-            fechou, motivo_saida = False, ""
-            if preco <= stop_loss:
-                fechou, motivo_saida = True, "Stop loss"
-            elif preco >= take_profit:
-                fechou, motivo_saida = True, "Take profit"
-            elif row["sinal"] == -1:
-                fechou, motivo_saida = True, "Sinal de venda"
+    preco     = float(u["Close"])
+    vwap      = float(u["vwap"])
+    atr       = float(u["atr"])
+    vol_rel   = float(u["vol_rel"])
 
-            if fechou:
-                resultado    = (preco - preco_entrada) * qtd_acoes
-                capital     += resultado
-                retorno_pct  = (preco - preco_entrada) / preco_entrada * 100
+    if pd.isna(vwap) or pd.isna(atr) or atr == 0:
+        return {"tipo": "NEUTRO", "forca": 0, "motivo": "VWAP/ATR indisponíveis"}
 
-                trades.append({
-                    "entrada":      data_entrada,
-                    "saida":        data,
-                    "preco_compra": round(preco_entrada, 2),
-                    "preco_venda":  round(preco, 2),
-                    "qtd":          qtd_acoes,
-                    "resultado":    round(resultado, 2),
-                    "retorno_pct":  round(retorno_pct, 2),
-                    "motivo_saida": motivo_saida,
-                    "capital_apos": round(capital, 2),
-                })
-                capital_historico.append(capital)
-                em_posicao = False
+    # Stop e alvo calculados pelo ATR (dinâmico)
+    stop_dist  = atr * Config.ATR_MULT_STOP
+    take_dist  = stop_dist * Config.RR_MINIMO
 
-        elif row["sinal"] == 1 and not em_posicao:
-            # Calcula tamanho da posição baseado no risco
-            risco_reais  = capital * risco_pct
-            distancia    = preco * stop_loss_pct
-            qtd          = max(1, math.floor(risco_reais / distancia))
+    # Quantidade de ações pelo risco por trade
+    risco_r    = capital * Config.RISCO_POR_TRADE
+    qtd        = max(1, int(risco_r / stop_dist))
 
-            # Garante que o capital é suficiente
-            custo_total  = qtd * preco
-            if custo_total > capital:
-                qtd = max(1, math.floor(capital / preco))
+    # Variáveis de contexto
+    vol_institucional = vol_rel >= Config.VOLUME_MULT
+    perto_vwap        = abs(preco - vwap) / vwap < 0.005   # dentro de 0.5% do VWAP
+    abaixo_vwap       = preco < vwap
+    acima_vwap        = preco > vwap
 
-            preco_entrada  = preco
-            qtd_acoes      = qtd
-            stop_loss      = preco * (1 - stop_loss_pct)
-            take_profit    = preco * (1 + take_profit_pct)
-            data_entrada   = data
-            motivo_entrada = "RSI sobrevendido" if row["rsi"] < Parametros.RSI_SOBREVENDA else "Cruzamento EMA"
-            em_posicao     = True
+    # Recuo ao VWAP (zone de interesse dos institucionais)
+    recuo_vwap_compra = abaixo_vwap and p["acima_vwap"]   # cruzou abaixo
+    recuo_vwap_venda  = acima_vwap  and not p["acima_vwap"]  # cruzou acima
 
-    return trades, pd.Series(capital_historico)
+    # Candle de reversão
+    reversao_alta  = (u["tocha_alta"] and not p["tocha_alta"]   # virou verde
+                      and float(u["Close"]) > float(p["High"]))   # rompeu a máxima anterior
+    reversao_baixa = (u["tocha_baixa"] and not p["tocha_baixa"]  # virou vermelho
+                      and float(u["Close"]) < float(p["Low"]))    # rompeu a mínima anterior
 
+    # ── SINAL DE COMPRA ────────────────────────────────────────────────
+    pontos_compra = 0
+    motivos_compra = []
 
-# ---------------------------------------------------------------------------
-# MÉTRICAS
-# ---------------------------------------------------------------------------
-def calcular_metricas(trades: List[Dict], capital_inicial: float, capital_final: float) -> Dict:
-    if not trades:
-        return {}
+    if abaixo_vwap or perto_vwap:
+        pontos_compra += 30
+        motivos_compra.append("Preço no VWAP (zona institucional)")
+    if vol_institucional:
+        pontos_compra += 30
+        motivos_compra.append(f"Volume institucional ({vol_rel:.1f}x a média)")
+    if reversao_alta:
+        pontos_compra += 25
+        motivos_compra.append("Candle de reversão de alta")
+    if recuo_vwap_compra:
+        pontos_compra += 15
+        motivos_compra.append("Recuo ao VWAP")
 
-    resultados   = [t["resultado"] for t in trades]
-    ganhos       = [r for r in resultados if r > 0]
-    perdas       = [r for r in resultados if r <= 0]
-    total        = len(trades)
+    # ── SINAL DE VENDA ─────────────────────────────────────────────────
+    pontos_venda = 0
+    motivos_venda = []
 
-    win_rate     = len(ganhos) / total * 100 if total else 0
-    lucro_total  = sum(resultados)
-    retorno_total = (capital_final - capital_inicial) / capital_inicial * 100
-    media_ganho  = sum(ganhos) / len(ganhos) if ganhos else 0
-    media_perda  = sum(perdas) / len(perdas) if perdas else 0
-    payoff       = abs(media_ganho / media_perda) if media_perda else 0
+    if acima_vwap or perto_vwap:
+        pontos_venda += 30
+        motivos_venda.append("Preço acima do VWAP (resistência)")
+    if vol_institucional:
+        pontos_venda += 30
+        motivos_venda.append(f"Volume institucional ({vol_rel:.1f}x a média)")
+    if reversao_baixa:
+        pontos_venda += 25
+        motivos_venda.append("Candle de reversão de baixa")
+    if recuo_vwap_venda:
+        pontos_venda += 15
+        motivos_venda.append("Toque acima do VWAP")
 
-    # Drawdown máximo
-    capital_series  = pd.Series([capital_inicial] + [t["capital_apos"] for t in trades])
-    pico            = capital_series.cummax()
-    drawdown_series = (capital_series - pico) / pico * 100
-    max_drawdown    = drawdown_series.min()
+    # Retorna o sinal mais forte (mínimo 55 pontos para entrar)
+    LIMIAR = 55
 
-    # Sequência máxima de perdas
-    seq_perdas, seq_max = 0, 0
-    for r in resultados:
-        if r <= 0:
-            seq_perdas += 1
-            seq_max = max(seq_max, seq_perdas)
-        else:
-            seq_perdas = 0
+    if pontos_compra >= LIMIAR and pontos_compra > pontos_venda:
+        sl = round(preco - stop_dist, 2)
+        tp = round(preco + take_dist, 2)
+        return {
+            "tipo":   "COMPRA",
+            "forca":  min(100, pontos_compra),
+            "preco":  preco,
+            "sl":     sl,
+            "tp":     tp,
+            "qtd":    qtd,
+            "vwap":   round(vwap, 2),
+            "atr":    round(atr, 2),
+            "vol_rel": round(vol_rel, 2),
+            "motivo": " + ".join(motivos_compra),
+        }
+
+    if pontos_venda >= LIMIAR and pontos_venda > pontos_compra:
+        sl = round(preco + stop_dist, 2)
+        tp = round(preco - take_dist, 2)
+        return {
+            "tipo":   "VENDA",
+            "forca":  min(100, pontos_venda),
+            "preco":  preco,
+            "sl":     sl,
+            "tp":     tp,
+            "qtd":    qtd,
+            "vwap":   round(vwap, 2),
+            "atr":    round(atr, 2),
+            "vol_rel": round(vol_rel, 2),
+            "motivo": " + ".join(motivos_venda),
+        }
 
     return {
-        "total_trades":   total,
-        "win_rate":       round(win_rate, 1),
-        "lucro_total":    round(lucro_total, 2),
-        "retorno_total":  round(retorno_total, 2),
-        "media_ganho":    round(media_ganho, 2),
-        "media_perda":    round(media_perda, 2),
-        "payoff":         round(payoff, 2),
-        "max_drawdown":   round(max_drawdown, 2),
-        "seq_max_perdas": seq_max,
-        "trades_ganho":   len(ganhos),
-        "trades_perda":   len(perdas),
+        "tipo":    "NEUTRO",
+        "forca":   0,
+        "preco":   preco,
+        "vwap":    round(vwap, 2),
+        "atr":     round(atr, 2),
+        "vol_rel": round(vol_rel, 2),
+        "motivo":  f"Aguardando confluência (compra:{pontos_compra}pts venda:{pontos_venda}pts)",
     }
 
 
-# ---------------------------------------------------------------------------
-# INTERFACE
-# ---------------------------------------------------------------------------
-def cor_resultado(valor: float) -> str:
-    return "🟢" if valor > 0 else "🔴"
+# ═══════════════════════════════════════════════════════════
+# INTERFACE — COMPONENTES
+# ═══════════════════════════════════════════════════════════
+def _barra_meta(pl: float) -> str:
+    """Barra ASCII de progresso da meta diária."""
+    pct   = max(-100, min(100, pl / Config.META_DIA * 100))
+    total = 20
+    cheio = int(abs(pct) / 100 * total)
+    if pl >= 0:
+        return f"[{'█' * cheio}{'░' * (total - cheio)}] {pl:+.2f} / R${Config.META_DIA:.0f}"
+    return f"[{'▓' * cheio}{'░' * (total - cheio)}] {pl:+.2f} / -R${Config.PERDA_MAX_DIA:.0f}"
 
 
-def main() -> None:
-    st.title("🔬 Backtesting — Robô Elite B3")
-    st.caption("Estratégia: RSI (14) + EMA 9/21 | Dados: yfinance")
+def exibir_painel_risco() -> None:
+    pl_dia   = st.session_state.get("pl_dia", 0.0)
+    n_trades = st.session_state.get("n_trades_dia", 0)
+    pode, _  = check_risk_management()
 
-    # ── Sidebar de configuração ───────────────────────────────────────────
-    with st.sidebar:
-        st.header("⚙️ Parâmetros")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("P&L do dia",    f"R$ {pl_dia:+.2f}",
+              delta_color="normal")
+    c2.metric("Meta diária",   f"R$ {Config.META_DIA:.0f}")
+    c3.metric("Perda máx.",    f"R$ {Config.PERDA_MAX_DIA:.0f}")
+    c4.metric("Trades hoje",   f"{n_trades}/{Config.MAX_TRADES_DIA}")
+    c5.metric("Status",        "✅ Operando" if pode else "🔒 Travado")
 
-        ticker         = st.text_input("Código da ação", value="BBAS3")
-        data_inicio    = st.date_input("Início", value=date(2022, 1, 1))
-        data_fim       = st.date_input("Fim",    value=date.today())
-        capital        = st.number_input("Capital inicial (R$)", value=10000, step=1000, min_value=1000)
-        risco_pct      = st.slider("Risco por trade (%)", 0.5, 5.0, 1.0, 0.5) / 100
-        stop_loss_pct  = st.slider("Stop loss (%)",        0.5, 5.0, 1.5, 0.5) / 100
-        take_profit_pct = st.slider("Take profit (%)",     0.5, 10.0, 3.0, 0.5) / 100
-
-        st.divider()
-        st.caption(f"Relação risco/retorno: 1 : {take_profit_pct / stop_loss_pct:.1f}")
-
-        rodar = st.button("▶️ Rodar backtesting", type="primary", use_container_width=True)
-
-    if not rodar:
-        st.info("Configure os parâmetros na barra lateral e clique em **▶️ Rodar backtesting**.")
-        return
-
-    # ── Download de dados ─────────────────────────────────────────────────
-    t = ticker.strip().upper()
-    if not t.endswith(".SA"):
-        t = f"{t}.SA"
-
-    with st.spinner(f"Baixando histórico de {t} via yfinance…"):
-        df_raw = yf.download(t, start=data_inicio, end=data_fim,
-                             interval="1d", progress=False, auto_adjust=True)
-
-    if df_raw.empty:
-        st.error("Nenhum dado retornado. Verifique o ticker e o período.")
-        return
-
-    # Flatten MultiIndex columns if present
-    if isinstance(df_raw.columns, pd.MultiIndex):
-        df_raw.columns = df_raw.columns.get_level_values(0)
-
-    df_raw = df_raw.reset_index()
-
-    st.success(f"{len(df_raw)} dias de histórico carregados ({data_inicio} → {data_fim})")
-
-    # ── Cálculo de indicadores e sinais ───────────────────────────────────
-    df = calcular_indicadores(df_raw)
-    df = gerar_sinais(df)
-
-    # ── Simulação ─────────────────────────────────────────────────────────
-    trades, capital_serie = simular_trades(
-        df, float(capital), risco_pct, stop_loss_pct, take_profit_pct
+    # Barra de progresso
+    cor = "green" if pl_dia >= 0 else "red"
+    st.markdown(
+        f"<p style='font-family:monospace; color:{cor}; font-size:13px;'>{_barra_meta(pl_dia)}</p>",
+        unsafe_allow_html=True,
     )
 
-    if not trades:
-        st.warning("Nenhuma operação gerada no período. Tente ampliar o intervalo ou ajustar os parâmetros.")
-        return
 
-    capital_final = trades[-1]["capital_apos"]
-    metricas      = calcular_metricas(trades, float(capital), capital_final)
+def exibir_sinal_tubarao(sinal: Dict) -> None:
+    tipo  = sinal.get("tipo", "NEUTRO")
+    forca = sinal.get("forca", 0)
+    preco = sinal.get("preco", 0)
+    vwap  = sinal.get("vwap", 0)
+    atr   = sinal.get("atr", 0)
+    vr    = sinal.get("vol_rel", 0)
 
-    # ── Métricas principais ───────────────────────────────────────────────
-    st.divider()
-    st.subheader("📊 Resultado geral")
+    if tipo == "COMPRA":
+        st.success(f"### 🟢 {tipo}  ·  Força: {forca}%")
+    elif tipo == "VENDA":
+        st.error(f"### 🔴 {tipo}  ·  Força: {forca}%")
+    else:
+        st.info(f"### ⚪ Aguardando sinal  ({forca}pts)")
+
+    if forca:
+        st.progress(forca / 100)
 
     c1, c2, c3, c4 = st.columns(4)
-    retorno = metricas["retorno_total"]
-    c1.metric("Retorno total",
-              f"R$ {metricas['lucro_total']:,.2f}",
-              f"{retorno:+.1f}%")
-    c2.metric("Capital final",   f"R$ {capital_final:,.2f}")
-    c3.metric("Win rate",        f"{metricas['win_rate']}%",
-              f"{metricas['trades_ganho']}G / {metricas['trades_perda']}P")
-    c4.metric("Drawdown máximo", f"{metricas['max_drawdown']:.1f}%")
+    c1.metric("Preço",  f"R$ {preco:.2f}")
+    c2.metric("VWAP",   f"R$ {vwap:.2f}")
+    c3.metric("ATR",    f"R$ {atr:.2f}")
+    c4.metric("Volume", f"{vr:.1f}x {'🐳' if vr >= Config.VOLUME_MULT else ''}")
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Total de trades",     metricas["total_trades"])
-    c6.metric("Payoff (ganho/perda)", f"{metricas['payoff']:.2f}x")
-    c7.metric("Média por ganho",     f"R$ {metricas['media_ganho']:,.2f}")
-    c8.metric("Seq. máx. de perdas", metricas["seq_max_perdas"])
+    if tipo in ("COMPRA", "VENDA"):
+        sl   = sinal.get("sl", 0)
+        tp   = sinal.get("tp", 0)
+        qtd  = sinal.get("qtd", 0)
+        rr   = abs(tp - preco) / abs(preco - sl) if preco != sl else 0
+        st.write(f"**🎯 TP:** R$ {tp:.2f} · **🛑 SL:** R$ {sl:.2f} · "
+                 f"**⚖️ RR:** 1:{rr:.1f} · **📦 Qtd:** {qtd} ações")
 
-    # ── Avaliação da estratégia ───────────────────────────────────────────
+    st.caption(f"💡 {sinal.get('motivo', '')}")
+
+
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
+def main() -> None:
+    # ── Session state ──────────────────────────────────────
+    defaults = {
+        "rodando":        False,
+        "em_posicao":     False,
+        "preco_entrada":  0.0,
+        "sl_entrada":     0.0,
+        "tp_entrada":     0.0,
+        "qtd_posicao":    0,
+        "pl_dia":         0.0,
+        "n_trades_dia":   0,
+        "ultimo_sinal":   None,
+        "sinal_pendente": None,
+        "ciclos":         0,
+        "mt5_ok":         False,
+        "capital_sim":    1000.0,
+        "travado":        False,
+        "motivo_trava":   "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    # ── Credenciais ────────────────────────────────────────
+    try:
+        tg_token = st.secrets["TOKEN_TELEGRAM"]
+        tg_id    = st.secrets["ID_TELEGRAM"]
+    except Exception:
+        tg_token = tg_id = ""
+
+    # ── Cabeçalho ──────────────────────────────────────────
+    st.title("🦈 Robô Tubarão B3 — Day Trade")
+    agora = datetime.now()
+    hora  = agora.time()
+
+    if hora < ABERTURA:
+        st.warning(f"🕙 Mercado abre às {ABERTURA.strftime('%H:%M')}")
+    elif hora >= FECHAMENTO_FORCADO:
+        st.info("🔒 Pregão encerrado")
+    else:
+        st.success(f"🟢 Pregão aberto · {agora.strftime('%H:%M:%S')}")
+
     st.divider()
-    st.subheader("🧠 Avaliação da estratégia")
-
-    pontos = []
-    alertas = []
-
-    if metricas["retorno_total"] > 0:
-        pontos.append(f"✅ Estratégia lucrativa no período (+{metricas['retorno_total']}%)")
-    else:
-        alertas.append(f"❌ Estratégia com prejuízo no período ({metricas['retorno_total']}%)")
-
-    if metricas["win_rate"] >= 50:
-        pontos.append(f"✅ Win rate acima de 50% ({metricas['win_rate']}%)")
-    else:
-        alertas.append(f"⚠️ Win rate abaixo de 50% ({metricas['win_rate']}%) — precisa de payoff alto para compensar")
-
-    if metricas["payoff"] >= 1.5:
-        pontos.append(f"✅ Payoff saudável ({metricas['payoff']}x)")
-    else:
-        alertas.append(f"⚠️ Payoff baixo ({metricas['payoff']}x) — ganhos médios não superam perdas médias adequadamente")
-
-    if metricas["max_drawdown"] > -20:
-        pontos.append(f"✅ Drawdown controlado ({metricas['max_drawdown']}%)")
-    else:
-        alertas.append(f"⚠️ Drawdown alto ({metricas['max_drawdown']}%) — risco de perda psicológica de controle")
-
-    if metricas["seq_max_perdas"] <= 5:
-        pontos.append(f"✅ Sequência máx. de perdas aceitável ({metricas['seq_max_perdas']} seguidas)")
-    else:
-        alertas.append(f"⚠️ {metricas['seq_max_perdas']} perdas seguidas no pior momento — avalie sua resiliência emocional")
-
-    for p in pontos:
-        st.success(p)
-    for a in alertas:
-        st.warning(a)
-
-    # ── Gráfico de evolução do capital ────────────────────────────────────
+    exibir_painel_risco()
     st.divider()
-    st.subheader("📈 Evolução do capital")
 
-    datas_trades = [float(capital)] + [t["capital_apos"] for t in trades]
-    st.line_chart(pd.DataFrame({"Capital (R$)": datas_trades}))
+    # ── Sidebar ────────────────────────────────────────────
+    with st.sidebar:
+        st.header("🦈 Configurações")
 
-    # ── Tabela de trades ──────────────────────────────────────────────────
+        if not MT5_OK:
+            st.error("MetaTrader5 não instalado:\n```\npip install MetaTrader5\n```")
+        else:
+            if st.button("🔌 Conectar MT5", use_container_width=True,
+                         disabled=st.session_state.mt5_ok):
+                if mt5_conectar():
+                    st.session_state.mt5_ok = True
+                    st.rerun()
+            if st.session_state.mt5_ok:
+                st.success(f"✅ MT5 · R$ {mt5_saldo():,.2f}")
+
+        st.divider()
+        ticker      = st.text_input("Ação", "BBAS3")
+        intervalo   = st.slider("Intervalo (s)", 15, 120, 30, 15)
+        modo_sim    = st.toggle("Modo simulação", True)
+        modo_semi   = st.toggle("Semi-auto (aprovar ordens)", True)
+
+        if modo_sim:
+            st.session_state.capital_sim = st.number_input(
+                "Capital simulado (R$)", 500, 100000,
+                int(st.session_state.capital_sim), 500)
+            st.success("🧪 Paper trade")
+        else:
+            st.warning("⚠️ ORDENS REAIS")
+
+        st.divider()
+        st.caption(f"🎯 Meta: R$ {Config.META_DIA:.0f}/dia")
+        st.caption(f"🛑 Perda máx: R$ {Config.PERDA_MAX_DIA:.0f}/dia")
+        st.caption(f"⚖️ RR mínimo: 1:{Config.RR_MINIMO:.0f}")
+        st.caption(f"📊 Risco/trade: {Config.RISCO_POR_TRADE*100:.0f}%")
+        st.caption(f"🔁 Ciclos: {st.session_state.ciclos}")
+
+    # ── Botões principais ──────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        if st.button("▶️ Ligar Tubarão", type="primary", use_container_width=True,
+                     disabled=st.session_state.rodando or st.session_state.travado):
+            if not modo_sim and not st.session_state.mt5_ok:
+                st.error("Conecte o MT5 antes de rodar no modo real.")
+            else:
+                st.session_state.rodando      = True
+                st.session_state.pl_dia       = 0.0
+                st.session_state.n_trades_dia = 0
+                st.session_state.travado      = False
+                log.info(f"Tubarão LIGADO | {ticker} | sim={modo_sim}")
+                tg_send(
+                    f"🦈 <b>Tubarão LIGADO</b>\n📌 <code>{ticker}</code>\n"
+                    f"🎯 Meta: R${Config.META_DIA:.0f} · 🛑 Perda max: R${Config.PERDA_MAX_DIA:.0f}\n"
+                    f"{'🧪 Simulação' if modo_sim else '💰 REAL'}",
+                    tg_token, tg_id,
+                )
+                st.rerun()
+
+    with c2:
+        if st.button("⏹️ Desligar", use_container_width=True,
+                     disabled=not st.session_state.rodando):
+            st.session_state.rodando = False
+            log.info("Tubarão DESLIGADO")
+            st.rerun()
+
+    with c3:
+        if st.button("🔒 Fechar Agora", use_container_width=True,
+                     disabled=not st.session_state.em_posicao):
+            p = mt5_fechar_posicao(ticker.upper(), st.session_state.qtd_posicao,
+                                   modo_sim, "Fechamento manual")
+            if p:
+                res = (p - st.session_state.preco_entrada) * st.session_state.qtd_posicao
+                st.session_state.pl_dia       += res
+                st.session_state.n_trades_dia += 1
+                st.session_state.em_posicao    = False
+                salvar_ordem("VENDA", ticker.upper(), p, st.session_state.qtd_posicao,
+                             "Fechamento manual", modo_sim, res)
+                tg_send(tg_resultado(ticker.upper(), res, st.session_state.pl_dia,
+                                    st.session_state.n_trades_dia, "Manual", modo_sim),
+                        tg_token, tg_id)
+            st.rerun()
+
+    # ── Aprovação manual ────────────────────────────────────
+    if modo_semi and st.session_state.sinal_pendente:
+        sinal = st.session_state.sinal_pendente
+        st.divider()
+        st.subheader("🔔 Aguardando sua aprovação")
+        exibir_sinal_tubarao(sinal)
+
+        ca, cr = st.columns(2)
+        with ca:
+            if st.button("✅ Executar ordem", type="primary", use_container_width=True):
+                tipo = sinal["tipo"]
+                sym  = ticker.upper()
+                capital = mt5_saldo() if st.session_state.mt5_ok else float(st.session_state.capital_sim)
+                qtd  = sinal.get("qtd", 1)
+                sl   = sinal["sl"]
+                tp   = sinal["tp"]
+
+                if tipo == "COMPRA" and not st.session_state.em_posicao:
+                    p = mt5_abrir_compra(sym, qtd, sl, tp, modo_sim)
+                    if p:
+                        st.session_state.em_posicao    = True
+                        st.session_state.preco_entrada = p
+                        st.session_state.sl_entrada    = sl
+                        st.session_state.tp_entrada    = tp
+                        st.session_state.qtd_posicao   = qtd
+                        salvar_ordem("COMPRA", sym, p, qtd, sinal["motivo"], modo_sim)
+                        tg_send(tg_entrada(sym, "COMPRA", p, qtd, sl, tp,
+                                          sinal["motivo"], modo_sim), tg_token, tg_id)
+
+                elif tipo == "VENDA" and st.session_state.em_posicao:
+                    p = mt5_fechar_posicao(sym, st.session_state.qtd_posicao,
+                                          modo_sim, sinal["motivo"])
+                    if p:
+                        res = (p - st.session_state.preco_entrada) * st.session_state.qtd_posicao
+                        st.session_state.pl_dia       += res
+                        st.session_state.n_trades_dia += 1
+                        st.session_state.em_posicao    = False
+                        salvar_ordem("VENDA", sym, p, st.session_state.qtd_posicao,
+                                    sinal["motivo"], modo_sim, res)
+                        tg_send(tg_resultado(sym, res, st.session_state.pl_dia,
+                                            st.session_state.n_trades_dia,
+                                            sinal["motivo"], modo_sim), tg_token, tg_id)
+
+                st.session_state.sinal_pendente = None
+                st.rerun()
+
+        with cr:
+            if st.button("❌ Recusar", use_container_width=True):
+                log.info(f"Sinal {sinal['tipo']} recusado")
+                st.session_state.sinal_pendente = None
+                st.rerun()
+
+    # ── Último sinal ────────────────────────────────────────
     st.divider()
-    st.subheader("📋 Histórico de operações")
+    st.subheader("📡 Leitura do mercado")
+    if st.session_state.ultimo_sinal:
+        exibir_sinal_tubarao(st.session_state.ultimo_sinal)
+    else:
+        st.info("Aguardando primeiro ciclo de análise…")
 
-    df_trades = pd.DataFrame(trades)
-    df_trades["resultado_fmt"] = df_trades["resultado"].apply(
-        lambda x: f"{cor_resultado(x)} R$ {x:,.2f}"
-    )
+    # ── Ordens e log ───────────────────────────────────────
+    tab_ordens, tab_log = st.tabs(["📋 Ordens do dia", "🗒️ Log"])
+    with tab_ordens:
+        if ARQ_ORDENS.exists():
+            df_o = pd.read_csv(ARQ_ORDENS)
+            hoje = date.today().isoformat()
+            dh   = df_o[df_o["data"] == hoje] if not df_o.empty else pd.DataFrame()
+            if not dh.empty:
+                st.dataframe(dh, use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhuma ordem hoje.")
+    with tab_log:
+        if ARQ_LOG.exists():
+            linhas = ARQ_LOG.read_text(encoding="utf-8").strip().splitlines()
+            st.code("\n".join(linhas[-40:]), language="text")
 
-    st.dataframe(
-        df_trades[[
-            "entrada", "saida", "preco_compra", "preco_venda",
-            "qtd", "resultado_fmt", "retorno_pct", "motivo_saida"
-        ]].rename(columns={
-            "entrada":      "Entrada",
-            "saida":        "Saída",
-            "preco_compra": "Preço compra",
-            "preco_venda":  "Preço venda",
-            "qtd":          "Qtd",
-            "resultado_fmt":"Resultado",
-            "retorno_pct":  "Retorno %",
-            "motivo_saida": "Motivo saída",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
+    # ═══════════════════════════════════════════════════════
+    # LOOP PRINCIPAL
+    # ═══════════════════════════════════════════════════════
+    if not st.session_state.rodando:
+        return
 
-    # Download CSV
-    csv = df_trades.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Baixar histórico de trades (.csv)",
-        data=csv,
-        file_name=f"backtest_{t}_{data_inicio}_{data_fim}.csv",
-        mime="text/csv",
-    )
+    hora  = datetime.now().time()
+    sym   = ticker.upper()
+    capital = mt5_saldo() if st.session_state.mt5_ok else float(st.session_state.capital_sim)
+
+    # ── Fechamento forçado 17:25 ───────────────────────────
+    if hora >= FECHAMENTO_FORCADO:
+        if st.session_state.em_posicao:
+            p = mt5_fechar_posicao(sym, st.session_state.qtd_posicao,
+                                   modo_sim, "Fechamento forçado 17:25")
+            if p:
+                res = (p - st.session_state.preco_entrada) * st.session_state.qtd_posicao
+                st.session_state.pl_dia       += res
+                st.session_state.n_trades_dia += 1
+                st.session_state.em_posicao    = False
+                salvar_ordem("VENDA", sym, p, st.session_state.qtd_posicao,
+                            "Fechamento forçado 17:25", modo_sim, res)
+                tg_send(tg_resultado(sym, res, st.session_state.pl_dia,
+                                    st.session_state.n_trades_dia,
+                                    "Fechamento forçado 17:25", modo_sim), tg_token, tg_id)
+        st.session_state.rodando = False
+        log.info("Robô encerrado — fim do pregão")
+        st.rerun()
+        return
+
+    # Fora do pregão
+    if hora < ABERTURA:
+        time.sleep(60); st.rerun(); return
+
+    # ── Check de risco — INEGOCIÁVEL ───────────────────────
+    pode, motivo_risco = check_risk_management()
+    if not pode:
+        if not st.session_state.travado:
+            st.session_state.travado      = True
+            st.session_state.motivo_trava = motivo_risco
+            log.warning(f"TRAVA: {motivo_risco}")
+            tg_send(tg_alerta_risco(motivo_risco, st.session_state.pl_dia, modo_sim),
+                    tg_token, tg_id)
+        st.warning(f"🔒 {motivo_risco}")
+        # Fecha posição aberta se o motivo for perda máxima
+        if st.session_state.em_posicao and "Perda máxima" in motivo_risco:
+            p = mt5_fechar_posicao(sym, st.session_state.qtd_posicao,
+                                   modo_sim, "Stop diário atingido")
+            if p:
+                res = (p - st.session_state.preco_entrada) * st.session_state.qtd_posicao
+                st.session_state.pl_dia      += res
+                st.session_state.em_posicao   = False
+                salvar_ordem("VENDA", sym, p, st.session_state.qtd_posicao,
+                            "Stop diário", modo_sim, res)
+        st.session_state.rodando = False
+        st.rerun()
+        return
+
+    # ── Ciclo de análise ───────────────────────────────────
+    with st.spinner(f"🦈 Analisando {sym}…"):
+        df = mt5_candles(sym, Config.N_CANDLES)
+
+    if df.empty:
+        log.warning(f"Sem candles para {sym}")
+        time.sleep(intervalo); st.rerun(); return
+
+    df    = calcular_todos_indicadores(df)
+    sinal = analisar_sinal_tubarao(df, capital)
+
+    st.session_state.ultimo_sinal = sinal
+    st.session_state.ciclos      += 1
+
+    # ── Verifica stop/tp da posição aberta ─────────────────
+    if st.session_state.em_posicao:
+        p_atual = float(sinal.get("preco", st.session_state.preco_entrada))
+        sl      = st.session_state.sl_entrada
+        tp      = st.session_state.tp_entrada
+
+        fechou, motivo_fechamento = False, ""
+        if p_atual <= sl:
+            fechou, motivo_fechamento = True, "Stop loss atingido"
+        elif p_atual >= tp:
+            fechou, motivo_fechamento = True, "Take profit atingido"
+        elif sinal["tipo"] == "VENDA":
+            if modo_semi:
+                st.session_state.sinal_pendente = sinal
+            else:
+                fechou, motivo_fechamento = True, sinal["motivo"]
+
+        if fechou and not (modo_semi and sinal["tipo"] == "VENDA"):
+            p = mt5_fechar_posicao(sym, st.session_state.qtd_posicao,
+                                   modo_sim, motivo_fechamento)
+            if p:
+                res = (p - st.session_state.preco_entrada) * st.session_state.qtd_posicao
+                st.session_state.pl_dia       += res
+                st.session_state.n_trades_dia += 1
+                st.session_state.em_posicao    = False
+                salvar_ordem("VENDA", sym, p, st.session_state.qtd_posicao,
+                            motivo_fechamento, modo_sim, res)
+                tg_send(tg_resultado(sym, res, st.session_state.pl_dia,
+                                    st.session_state.n_trades_dia,
+                                    motivo_fechamento, modo_sim), tg_token, tg_id)
+            st.rerun()
+            return
+
+    # ── Abre nova posição (se não estiver em posição) ──────
+    elif sinal["tipo"] == "COMPRA":
+        if modo_semi:
+            st.session_state.sinal_pendente = sinal
+        else:
+            p = mt5_abrir_compra(sym, sinal["qtd"], sinal["sl"], sinal["tp"], modo_sim)
+            if p:
+                st.session_state.em_posicao    = True
+                st.session_state.preco_entrada = p
+                st.session_state.sl_entrada    = sinal["sl"]
+                st.session_state.tp_entrada    = sinal["tp"]
+                st.session_state.qtd_posicao   = sinal["qtd"]
+                salvar_ordem("COMPRA", sym, p, sinal["qtd"], sinal["motivo"], modo_sim)
+                tg_send(tg_entrada(sym, "COMPRA", p, sinal["qtd"],
+                                  sinal["sl"], sinal["tp"], sinal["motivo"], modo_sim),
+                        tg_token, tg_id)
+
+    time.sleep(intervalo)
+    st.rerun()
 
 
 if __name__ == "__main__":
