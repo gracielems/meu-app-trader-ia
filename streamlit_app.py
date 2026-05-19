@@ -690,6 +690,17 @@ def main() -> None:
         if k not in st.session_state:
             st.session_state[k] = v
 
+    # Guard: evita st.rerun() duplo na mesma execução (causa erro de DOM no Streamlit)
+    if st.session_state.get("_rerun_bloqueado"):
+        st.session_state["_rerun_bloqueado"] = False
+        return
+
+    def rerun_seguro(delay: float = 0.5) -> None:
+        """Aguarda um tempo mínimo antes de rerun para evitar conflito de DOM."""
+        st.session_state["_rerun_bloqueado"] = True
+        time.sleep(delay)
+        st.rerun()
+
     # ── Credenciais ────────────────────────────────────────
     try:
         tg_token = st.secrets["TOKEN_TELEGRAM"]
@@ -724,7 +735,7 @@ def main() -> None:
                          disabled=st.session_state.mt5_ok):
                 if mt5_conectar():
                     st.session_state.mt5_ok = True
-                    st.rerun()
+                    rerun_seguro(0.3)
             if st.session_state.mt5_ok:
                 st.success(f"✅ MT5 · R$ {mt5_saldo():,.2f}")
 
@@ -769,14 +780,14 @@ def main() -> None:
                     f"{'🧪 Simulação' if modo_sim else '💰 REAL'}",
                     tg_token, tg_id,
                 )
-                st.rerun()
+                rerun_seguro(0.3)
 
     with c2:
         if st.button("⏹️ Desligar", use_container_width=True,
                      disabled=not st.session_state.rodando):
             st.session_state.rodando = False
             log.info("Tubarão DESLIGADO")
-            st.rerun()
+            rerun_seguro(0.3)
 
     with c3:
         if st.button("🔒 Fechar Agora", use_container_width=True,
@@ -793,7 +804,7 @@ def main() -> None:
                 tg_send(tg_resultado(ticker.upper(), res, st.session_state.pl_dia,
                                     st.session_state.n_trades_dia, "Manual", modo_sim),
                         tg_token, tg_id)
-            st.rerun()
+            rerun_seguro(0.3)
 
     # ── Aprovação manual ────────────────────────────────────
     if modo_semi and st.session_state.sinal_pendente:
@@ -839,13 +850,13 @@ def main() -> None:
                                             sinal["motivo"], modo_sim), tg_token, tg_id)
 
                 st.session_state.sinal_pendente = None
-                st.rerun()
+                rerun_seguro(0.3)
 
         with cr:
             if st.button("❌ Recusar", use_container_width=True):
                 log.info(f"Sinal {sinal['tipo']} recusado")
                 st.session_state.sinal_pendente = None
-                st.rerun()
+                rerun_seguro(0.3)
 
     # ── Último sinal ────────────────────────────────────────
     st.divider()
@@ -898,7 +909,7 @@ def main() -> None:
                                     "Fechamento forçado 17:25", modo_sim), tg_token, tg_id)
         st.session_state.rodando = False
         log.info("Robô encerrado — fim do pregão")
-        st.rerun()
+        rerun_seguro(1)
         return
 
     # Fora do pregão
@@ -926,7 +937,7 @@ def main() -> None:
                 salvar_ordem("VENDA", sym, p, st.session_state.qtd_posicao,
                             "Stop diário", modo_sim, res)
         st.session_state.rodando = False
-        st.rerun()
+        rerun_seguro(1)
         return
 
     # ── Ciclo de análise ───────────────────────────────────
@@ -935,7 +946,7 @@ def main() -> None:
 
     if df.empty:
         log.warning(f"Sem candles para {sym}")
-        time.sleep(intervalo); st.rerun(); return
+        rerun_seguro(intervalo); return
 
     df    = calcular_todos_indicadores(df)
     sinal = analisar_sinal_tubarao(df, capital)
@@ -973,7 +984,7 @@ def main() -> None:
                 tg_send(tg_resultado(sym, res, st.session_state.pl_dia,
                                     st.session_state.n_trades_dia,
                                     motivo_fechamento, modo_sim), tg_token, tg_id)
-            st.rerun()
+            rerun_seguro(1)
             return
 
     # ── Abre nova posição (se não estiver em posição) ──────
@@ -993,8 +1004,7 @@ def main() -> None:
                                   sinal["sl"], sinal["tp"], sinal["motivo"], modo_sim),
                         tg_token, tg_id)
 
-    time.sleep(intervalo)
-    st.rerun()
+    rerun_seguro(max(intervalo, 1))
 
 
 if __name__ == "__main__":
