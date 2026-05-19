@@ -735,7 +735,7 @@ def main() -> None:
                          disabled=st.session_state.mt5_ok):
                 if mt5_conectar():
                     st.session_state.mt5_ok = True
-                    rerun_seguro(0.3)
+                    pass  # Streamlit já faz rerun ao clicar em botão
             if st.session_state.mt5_ok:
                 st.success(f"✅ MT5 · R$ {mt5_saldo():,.2f}")
 
@@ -780,14 +780,14 @@ def main() -> None:
                     f"{'🧪 Simulação' if modo_sim else '💰 REAL'}",
                     tg_token, tg_id,
                 )
-                rerun_seguro(0.3)
+                pass  # Streamlit já faz rerun ao clicar em botão
 
     with c2:
         if st.button("⏹️ Desligar", use_container_width=True,
                      disabled=not st.session_state.rodando):
             st.session_state.rodando = False
             log.info("Tubarão DESLIGADO")
-            rerun_seguro(0.3)
+            pass  # Streamlit já faz rerun ao clicar em botão
 
     with c3:
         if st.button("🔒 Fechar Agora", use_container_width=True,
@@ -804,7 +804,7 @@ def main() -> None:
                 tg_send(tg_resultado(ticker.upper(), res, st.session_state.pl_dia,
                                     st.session_state.n_trades_dia, "Manual", modo_sim),
                         tg_token, tg_id)
-            rerun_seguro(0.3)
+            pass  # Streamlit já faz rerun ao clicar em botão
 
     # ── Aprovação manual ────────────────────────────────────
     if modo_semi and st.session_state.sinal_pendente:
@@ -850,13 +850,13 @@ def main() -> None:
                                             sinal["motivo"], modo_sim), tg_token, tg_id)
 
                 st.session_state.sinal_pendente = None
-                rerun_seguro(0.3)
+                pass  # Streamlit já faz rerun ao clicar em botão
 
         with cr:
             if st.button("❌ Recusar", use_container_width=True):
                 log.info(f"Sinal {sinal['tipo']} recusado")
                 st.session_state.sinal_pendente = None
-                rerun_seguro(0.3)
+                pass  # Streamlit já faz rerun ao clicar em botão
 
     # ── Último sinal ────────────────────────────────────────
     st.divider()
