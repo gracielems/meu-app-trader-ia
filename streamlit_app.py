@@ -194,9 +194,14 @@ def check_risk_management() -> Tuple[bool, str]:
 
 
 # ═══════════════════════════════════════════════════════════
-# MT5 — CONEXÃO E EXECUÇÃO
+# MT5 — CONEXÃO E EXECUÇÃO (Clear Corretora)
 # ═══════════════════════════════════════════════════════════
+# Clear usa ORDER_FILLING_RETURN — obrigatório para ações B3
+FILLING_MODE = mt5.ORDER_FILLING_RETURN if MT5_OK else 0
+
+
 def mt5_conectar() -> bool:
+    """Conecta ao MT5. O app deve estar aberto e logado na Clear."""
     if not MT5_OK:
         return False
     if not mt5.initialize():
@@ -204,15 +209,58 @@ def mt5_conectar() -> bool:
         return False
     info = mt5.account_info()
     if not info:
-        log.error("MT5: nenhuma conta conectada")
+        log.error("MT5: abra o MetaTrader 5 e faça login na Clear.")
         return False
-    log.info(f"MT5 OK | {info.login} | {info.company} | R$ {info.balance:.2f}")
+    log.info(f"MT5 OK | Login:{info.login} | {info.company} | "
+             f"Saldo:R${info.balance:.2f} | Patrimônio:R${info.equity:.2f}")
+    return True
+
+
+def mt5_auto_conectar() -> bool:
+    """Tenta conectar automaticamente ao iniciar o app."""
+    if not MT5_OK or st.session_state.get("mt5_ok"):
+        return st.session_state.get("mt5_ok", False)
+    ok = mt5_conectar()
+    if ok:
+        st.session_state.mt5_ok = True
+    return ok
+
+
+def mt5_info_conta() -> Optional[Dict]:
+    """Retorna saldo, patrimônio e lucro da conta MT5."""
+    if not MT5_OK:
+        return None
+    info = mt5.account_info()
+    if not info:
+        return None
+    return {
+        "login":        info.login,
+        "corretora":    info.company,
+        "saldo":        info.balance,
+        "patrimonio":   info.equity,
+        "margem_livre": info.margin_free,
+        "lucro":        info.profit,
+    }
+
+
+def mt5_habilitar_symbol(ticker: str) -> bool:
+    """Garante que o símbolo está visível no Market Watch do MT5."""
+    if not MT5_OK:
+        return True
+    info = mt5.symbol_info(ticker)
+    if info is None:
+        log.error(f"Símbolo {ticker} não encontrado. Verifique no MT5.")
+        return False
+    if not info.visible:
+        if not mt5.symbol_select(ticker, True):
+            log.error(f"Falha ao habilitar {ticker} no MT5.")
+            return False
     return True
 
 
 def mt5_saldo() -> float:
-    if not MT5_OK:
-        return st.session_state.get("capital_sim", 1000.0)
+    if not MT5_OK or not st.session_state.get("mt5_ok"):
+        return float(st.session_state.get("capital_sim", 1000.0))
     info = mt5.account_info()
     return info.balance if info else 0.0
 
@@ -251,6 +299,7 @@ def mt5_candles(ticker: str, n: int) -> pd.DataFrame:
     """Busca candles do MT5 (real) ou yfinance (simulação no Streamlit Cloud)."""
     if not MT5_OK:
         return _yf_candles(ticker, n)
+    mt5_habilitar_symbol(ticker)
     rates = mt5.copy_rates_from_pos(ticker, Config.TIMEFRAME_MT5, 0, n)
     if rates is None:
         return pd.DataFrame()
@@ -285,6 +334,9 @@ def mt5_abrir_compra(ticker: str, qtd: int, sl: float, tp: float,
         p = mt5_preco_ask(ticker) or st.session_state.get("preco_sim", 10.0)
         log.info(f"[SIM] COMPRA {qtd}x {ticker} @ R${p:.2f} SL:{sl:.2f} TP:{tp:.2f}")
         return p
+    if not mt5_habilitar_symbol(ticker):
+        log.error(f"Símbolo {ticker} não habilitado — ordem cancelada")
+        return None
     preco = mt5_preco_ask(ticker)
     req = {
         "action":       mt5.TRADE_ACTION_DEAL,
@@ -298,7 +350,7 @@ def mt5_abrir_compra(ticker: str, qtd: int, sl: float, tp: float,
         "magic":        20250101,
         "comment":      "Tubarao B3",
         "type_time":    mt5.ORDER_TIME_DAY,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": FILLING_MODE,
     }
     res = mt5.order_send(req)
     if res.retcode != mt5.TRADE_RETCODE_DONE:
@@ -330,7 +382,7 @@ def mt5_fechar_posicao(ticker: str, qtd: int, simulacao: bool,
         "magic":        20250101,
         "comment":      motivo or "Tubarao B3",
         "type_time":    mt5.ORDER_TIME_DAY,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": FILLING_MODE,
     }
     res = mt5.order_send(req)
     if res.retcode != mt5.TRADE_RETCODE_DONE:
