@@ -14,6 +14,7 @@ import time
 import logging
 import csv
 import requests as _requests
+import yfinance as yf
 from datetime import datetime, time as dtime, date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -65,11 +66,6 @@ class Config:
 # ═══════════════════════════════════════════════════════════
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-# ═══════════════════════════════════════════════════════════
-# LOGS
-# ═══════════════════════════════════════════════════════════
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
 ARQ_LOG    = LOG_DIR / "tubarao.log"
 ARQ_ORDENS = LOG_DIR / "ordens.csv"
 
@@ -85,7 +81,10 @@ def _get_logger() -> logging.Logger:
         h.setFormatter(fmt)
         logger.addHandler(h)
     return logger
+
 log = _get_logger()
+
+
 # ═══════════════════════════════════════════════════════════
 # INTERFACE VISUAL (STREAMLIT)
 # ═══════════════════════════════════════════════════════════
@@ -108,8 +107,6 @@ with col3:
     st.metric(label="Risco por Trade", value=f"{Config.RISCO_POR_TRADE * 100}%")
 
 st.divider()
-
-import yfinance as yf
 
 st.subheader("📊 Gráfico do Índice (Tempo Real - 5 min)")
 
