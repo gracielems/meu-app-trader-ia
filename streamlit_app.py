@@ -109,4 +109,15 @@ with col3:
 
 st.divider()
 
-st.info("🟢 Interface carregada com sucesso! O próximo passo é puxar os dados de mercado e mostrar os gráficos aqui.")
+import yfinance as yf
+
+st.subheader("📊 Gráfico do Índice (Tempo Real - 5 min)")
+
+# Puxando os dados do dia atual com candles de 5 minutos
+dados_indice = yf.download("^BVSP", period="1d", interval="5m", progress=False)
+
+if not dados_indice.empty:
+    # Mostra um gráfico de linha simples com o preço de fechamento
+    st.line_chart(dados_indice['Close'])
+else:
+    st.warning("Aguardando dados do mercado ou pregão fechado.")
