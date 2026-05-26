@@ -116,4 +116,4 @@ dados_indice = yf.download("BOVA11.SA", period="5d", interval="5m", progress=Fal
 
 # Se as colunas vierem no formato duplo do Yahoo, remove o segundo nível para o Plotly ler corretamente
 if isinstance(dados_indice.columns, pd.MultiIndex):
-    dados_indice.columns = dados
+dados_indice.columns = dados_indice.columns.droplevel(1)
