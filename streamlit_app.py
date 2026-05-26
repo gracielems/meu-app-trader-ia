@@ -85,6 +85,28 @@ def _get_logger() -> logging.Logger:
         h.setFormatter(fmt)
         logger.addHandler(h)
     return logger
-
-
 log = _get_logger()
+# ═══════════════════════════════════════════════════════════
+# INTERFACE VISUAL (STREAMLIT)
+# ═══════════════════════════════════════════════════════════
+
+st.title("🦈 Robô Tubarão B3")
+st.markdown("### Painel de Controle - Day Trade")
+
+st.divider()
+
+# Criando 3 colunas para mostrar os parâmetros da estratégia
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.metric(label="Meta Diária", value=f"R$ {Config.META_DIA}")
+
+with col2:
+    st.metric(label="Perda Máxima (Stop)", value=f"R$ {Config.PERDA_MAX_DIA}")
+
+with col3:
+    st.metric(label="Risco por Trade", value=f"{Config.RISCO_POR_TRADE * 100}%")
+
+st.divider()
+
+st.info("🟢 Interface carregada com sucesso! O próximo passo é puxar os dados de mercado e mostrar os gráficos aqui.")
