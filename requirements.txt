@@ -1,6 +1,5 @@
 streamlit
 pandas
 numpy
-MetaTrader5
 yfinance
 plotly
