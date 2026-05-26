@@ -114,6 +114,29 @@ st.subheader("📊 Gráfico do ETF BOVA11 (Tempo Real - 5 min)")
 # Puxando dados estáveis do ETF BOVA11 para evitar os travamentos do índice teórico
 dados_indice = yf.download("BOVA11.SA", period="5d", interval="5m", progress=False)
 
-# Se as colunas vierem no formato duplo do Yahoo, remove o segundo nível para o Plotly ler corretamente
+# Se as colunas vierem no formato duplo do Yahoo, remove o segundo nível com o recuo correto
 if isinstance(dados_indice.columns, pd.MultiIndex):
-dados_indice.columns = dados_indice.columns.droplevel(1)
+    dados_indice.columns = dados_indice.columns.droplevel(1)
+
+if not dados_indice.empty:
+    # Criando o gráfico de Velas (Candlestick) profissional
+    fig = go.Figure(data=[go.Candlestick(
+        x=dados_indice.index,
+        open=dados_indice['Open'],
+        high=dados_indice['High'],
+        low=dados_indice['Low'],
+        close=dados_indice['Close'],
+        name="BOVA11"
+    )])
+
+    # Ajustando o visual do layout do gráfico
+    fig.update_layout(
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=20, r=20, t=20, b=20),
+        height=500
+    )
+
+    # Exibe o gráfico na tela
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st
