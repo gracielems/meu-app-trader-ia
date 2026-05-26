@@ -15,6 +15,7 @@ import logging
 import csv
 import requests as _requests
 import yfinance as yf
+import plotly.graph_objects as go
 from datetime import datetime, time as dtime, date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -114,7 +115,24 @@ st.subheader("📊 Gráfico do Índice (Tempo Real - 5 min)")
 dados_indice = yf.download("^BVSP", period="2d", interval="5m", progress=False)
 
 if not dados_indice.empty:
-    # Mostra o gráfico de linha com o preço de fechamento
-    st.line_chart(dados_indice['Close'])
+    # Criando o gráfico de Velas (Candlestick) profissional
+    fig = go.Figure(data=[go.Candlestick(
+        x=dados_indice.index,
+        open=dados_indice['Open'],
+        high=dados_indice['High'],
+        low=dados_indice['Low'],
+        close=dados_indice['Close'],
+        name="Índice"
+    )])
+
+    # Ajustando o visual para remover aquela barra de baixo e deixar limpo
+    fig.update_layout(
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=20, r=20, t=20, b=20),
+        height=500
+    )
+
+    # Exibe o gráfico na tela
+    st.plotly_chart(fig, use_container_width=True)
 else:
     st.warning("Aguardando dados do mercado ou pregão fechado.")
