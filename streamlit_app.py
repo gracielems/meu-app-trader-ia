@@ -65,6 +65,11 @@ class Config:
 # ═══════════════════════════════════════════════════════════
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
+# ═══════════════════════════════════════════════════════════
+# LOGS
+# ═══════════════════════════════════════════════════════════
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
 ARQ_LOG    = LOG_DIR / "tubarao.log"
 ARQ_ORDENS = LOG_DIR / "ordens.csv"
 
@@ -72,3 +77,14 @@ ARQ_ORDENS = LOG_DIR / "ordens.csv"
 def _get_logger() -> logging.Logger:
     logger = logging.getLogger("tubarao_b3")
     if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    for h in [logging.FileHandler(ARQ_LOG, encoding="utf-8"), logging.StreamHandler()]:
+        h.setFormatter(fmt)
+        logger.addHandler(h)
+    return logger
+
+
+log = _get_logger()
