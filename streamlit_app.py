@@ -109,30 +109,11 @@ with col3:
 
 st.divider()
 
-st.subheader("📊 Gráfico do Índice (Tempo Real - 5 min)")
+st.subheader("📊 Gráfico do ETF BOVA11 (Tempo Real - 5 min)")
 
-# Puxando os dados de 2 dias para garantir que o Yahoo entregue o tempo real de hoje
-dados_indice = yf.download("^BVSP", period="5d", interval="5m", progress=False)
+# Puxando dados estáveis do ETF BOVA11 para evitar os travamentos do índice teórico
+dados_indice = yf.download("BOVA11.SA", period="5d", interval="5m", progress=False)
 
-if not dados_indice.empty:
-    # Criando o gráfico de Velas (Candlestick) profissional
-    fig = go.Figure(data=[go.Candlestick(
-        x=dados_indice.index,
-        open=dados_indice['Open'],
-        high=dados_indice['High'],
-        low=dados_indice['Low'],
-        close=dados_indice['Close'],
-        name="Índice"
-    )])
-
-    # Ajustando o visual para remover aquela barra de baixo e deixar limpo
-    fig.update_layout(
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=20, r=20, t=20, b=20),
-        height=500
-    )
-
-    # Exibe o gráfico na tela
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.warning("Aguardando dados do mercado ou pregão fechado.")
+# Se as colunas vierem no formato duplo do Yahoo, remove o segundo nível para o Plotly ler corretamente
+if isinstance(dados_indice.columns, pd.MultiIndex):
+    dados_indice.columns = dados
