@@ -112,7 +112,7 @@ st.divider()
 st.subheader("📊 Gráfico do Índice (Tempo Real - 5 min)")
 
 # Puxando os dados de 2 dias para garantir que o Yahoo entregue o tempo real de hoje
-dados_indice = yf.download("^BVSP", period="2d", interval="5m", progress=False)
+dados_indice = yf.download("^BVSP", period="5d", interval="5m", progress=False)
 
 if not dados_indice.empty:
     # Criando o gráfico de Velas (Candlestick) profissional
