@@ -359,11 +359,6 @@ st.divider()
 
 def rerun_seguro(delay: float = 0.5) -> None:
     if st.session_state.get("_rerun_bloqueado"):
-        return
-    st.session_state["_rerun_bloqueado"] = True
-    time.sleep(delay)
-    st.rerun()
-
 if st.session_state.rodando:
     agora = datetime.now().time()
     
@@ -371,12 +366,12 @@ if st.session_state.rodando:
         st.warning("⏰ Mercado fechado")
         time.sleep(60)
         st.rerun()
-        return
-    
+        # O 'return' foi removido daqui
+        
     if agora >= INICIO_OPERACOES and agora <= FECHAMENTO_ORDENS:
         st.info(f"🟢 Monitorando... ({intervalo}s)")
         rerun_seguro(intervalo)
-    
+        
     if agora > FECHAMENTO_ORDENS:
         st.warning("🔔 Fechando...")
         rerun_seguro(1)
